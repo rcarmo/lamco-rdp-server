@@ -259,6 +259,21 @@ fn unicode_to_evdev(cp: u16) -> Option<(u32, bool)> {
     }
 }
 
+/// Convert an RDP Unicode input code unit into an XKB keysym.
+///
+/// X11/XKB represents Unicode characters outside Latin-1 as `0x01000000 | codepoint`.
+/// RDP Unicode input delivers UTF-16 code units; the current IronRDP server API exposes
+/// each unit as `u16`, so supplementary-plane characters that require surrogate pairs
+/// cannot be represented as a single keysym here.
+fn unicode_to_keysym(cp: u16) -> Option<i32> {
+    match cp {
+        0xD800..=0xDFFF => None,
+        0x0000..=0x001F | 0x007F..=0x009F => None,
+        0x0020..=0x00FF => Some(i32::from(cp)),
+        _ => Some((0x0100_0000u32 | u32::from(cp)) as i32),
+    }
+}
+
 fn portal_err(e: impl std::fmt::Display) -> InputError {
     InputError::PortalError(e.to_string())
 }
@@ -587,9 +602,18 @@ impl LamcoInputHandler {
                         .notify_keyboard_keycode(keycode as i32, true)
                         .await
                         .map_err(portal_err)?;
+                } else if let Some(keysym) = unicode_to_keysym(unicode) {
+                    debug!(
+                        "Unicode press 0x{:04X} -> XKB keysym 0x{:08X}",
+                        unicode, keysym
+                    );
+                    session_handle
+                        .notify_keyboard_keysym(keysym, true)
+                        .await
+                        .map_err(portal_err)?;
                 } else {
                     debug!(
-                        "Unicode press 0x{:04X}: no evdev mapping (non-ASCII or unmapped)",
+                        "Unicode press 0x{:04X}: no evdev or keysym mapping",
                         unicode
                     );
                 }
@@ -611,9 +635,18 @@ impl LamcoInputHandler {
                             .await
                             .map_err(portal_err)?;
                     }
+                } else if let Some(keysym) = unicode_to_keysym(unicode) {
+                    debug!(
+                        "Unicode release 0x{:04X} -> XKB keysym 0x{:08X}",
+                        unicode, keysym
+                    );
+                    session_handle
+                        .notify_keyboard_keysym(keysym, false)
+                        .await
+                        .map_err(portal_err)?;
                 } else {
                     debug!(
-                        "Unicode release 0x{:04X}: no evdev mapping (non-ASCII or unmapped)",
+                        "Unicode release 0x{:04X}: no evdev or keysym mapping",
                         unicode
                     );
                 }
@@ -823,6 +856,24 @@ impl Clone for LamcoInputHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::unicode_to_keysym;
+
+    #[test]
+    fn unicode_to_keysym_maps_bmp_cjk_to_xkb_unicode_keysym() {
+        assert_eq!(unicode_to_keysym('中' as u16), Some(0x0100_4E2D));
+        assert_eq!(unicode_to_keysym('文' as u16), Some(0x0100_6587));
+    }
+
+    #[test]
+    fn unicode_to_keysym_keeps_latin1_keysyms_direct() {
+        assert_eq!(unicode_to_keysym('é' as u16), Some(0x00E9));
+    }
+
+    #[test]
+    fn unicode_to_keysym_rejects_surrogate_code_units() {
+        assert_eq!(unicode_to_keysym(0xD83D), None);
+        assert_eq!(unicode_to_keysym(0xDE00), None);
+    }
 
     #[test]
     fn test_input_handler_clone() {

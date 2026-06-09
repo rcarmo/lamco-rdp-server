@@ -4,9 +4,12 @@
 //! trait. All ClipboardBackend methods are synchronous, so they run on
 //! `tokio::task::spawn_blocking`.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -33,6 +36,10 @@ pub struct DataControlClipboardProvider {
     event_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<ClipboardProviderEvent>>>,
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
+    /// Data-control sources need bytes available synchronously when the
+    /// compositor asks for them. Keep eagerly fetched RDP data here so a
+    /// later SetClipboard can publish MIME types together with their bytes.
+    source_data: Arc<Mutex<HashMap<String, Vec<u8>>>>,
 }
 
 impl DataControlClipboardProvider {
@@ -63,6 +70,7 @@ impl DataControlClipboardProvider {
             _event_tx: event_tx,
             event_rx: std::sync::Mutex::new(Some(event_rx)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            source_data: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -80,16 +88,29 @@ impl ClipboardProvider for DataControlClipboardProvider {
 
     async fn announce_formats(&self, mime_types: Vec<String>) -> Result<()> {
         let backend = Arc::clone(&self.backend);
+        let cached_source_data = {
+            let guard = self.source_data.lock().map_err(|e| {
+                ClipboardError::PortalError(format!("Source data lock poisoned: {e}"))
+            })?;
+
+            mime_types
+                .iter()
+                .filter_map(|mime| guard.get(mime).map(|data| (mime.clone(), data.clone())))
+                .collect::<HashMap<_, _>>()
+        };
 
         tokio::task::spawn_blocking(move || {
             let mut guard = backend
                 .lock()
                 .map_err(|e| ClipboardError::PortalError(format!("Backend lock poisoned: {e}")))?;
 
-            // Build ClipboardData with MIME types to announce (empty data map for delayed rendering)
+            // Data-control cannot rely on Portal-style delayed rendering: by the
+            // time a remote paste happens, the compositor expects the source to
+            // serve data synchronously. Publish any eagerly fetched bytes with
+            // the MIME list.
             let data = xdg_desktop_portal_generic::types::ClipboardData {
                 mime_types,
-                data: std::collections::HashMap::new(),
+                data: cached_source_data,
             };
 
             guard
@@ -132,6 +153,13 @@ impl ClipboardProvider for DataControlClipboardProvider {
     async fn provide_data(&self, mime_type: &str, data: Vec<u8>) -> Result<()> {
         let backend = Arc::clone(&self.backend);
         let mime_owned = mime_type.to_string();
+
+        {
+            let mut guard = self.source_data.lock().map_err(|e| {
+                ClipboardError::PortalError(format!("Source data lock poisoned: {e}"))
+            })?;
+            guard.insert(mime_owned.clone(), data.clone());
+        }
 
         tokio::task::spawn_blocking(move || {
             let mut guard = backend
@@ -211,10 +239,89 @@ impl ClipboardProvider for DataControlClipboardProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use xdg_desktop_portal_generic::{ClipboardProtocol, types::ClipboardData};
+
+    #[derive(Default)]
+    struct MockClipboardBackend {
+        last_clipboard: Option<ClipboardData>,
+        source_updates: HashMap<String, Vec<u8>>,
+    }
+
+    impl ClipboardBackend for MockClipboardBackend {
+        fn protocol_type(&self) -> ClipboardProtocol {
+            ClipboardProtocol::ExtDataControl
+        }
+
+        fn get_clipboard(&self) -> xdg_desktop_portal_generic::Result<ClipboardData> {
+            Ok(self.last_clipboard.clone().unwrap_or_default())
+        }
+
+        fn set_clipboard(&mut self, data: ClipboardData) -> xdg_desktop_portal_generic::Result<()> {
+            self.last_clipboard = Some(data);
+            Ok(())
+        }
+
+        fn on_selection_changed(&mut self, _callback: Box<dyn Fn(Vec<String>) + Send + Sync>) {}
+
+        fn read_selection(
+            &self,
+            mime_type: &str,
+        ) -> xdg_desktop_portal_generic::Result<Option<Vec<u8>>> {
+            Ok(self
+                .last_clipboard
+                .as_ref()
+                .and_then(|clipboard| clipboard.data.get(mime_type).cloned()))
+        }
+
+        fn update_source_data(
+            &mut self,
+            mime_type: &str,
+            data: Vec<u8>,
+        ) -> xdg_desktop_portal_generic::Result<()> {
+            self.source_updates.insert(mime_type.to_string(), data);
+            Ok(())
+        }
+
+        fn write_done(
+            &mut self,
+            _serial: u32,
+            _success: bool,
+        ) -> xdg_desktop_portal_generic::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_provider_name_compiles() {
         fn assert_provider<T: ClipboardProvider>() {}
         assert_provider::<DataControlClipboardProvider>();
+    }
+
+    #[tokio::test]
+    async fn test_announce_formats_includes_eagerly_cached_source_data() {
+        let backend: Arc<Mutex<Box<dyn ClipboardBackend>>> =
+            Arc::new(Mutex::new(Box::<MockClipboardBackend>::default()));
+        let provider = DataControlClipboardProvider::new(Arc::clone(&backend));
+
+        provider
+            .provide_data("text/plain", b"hello from rdp".to_vec())
+            .await
+            .unwrap();
+        provider
+            .announce_formats(vec![
+                "text/plain".to_string(),
+                "text/plain;charset=utf-8".to_string(),
+            ])
+            .await
+            .unwrap();
+
+        let guard = backend.lock().unwrap();
+        let clipboard = guard.get_clipboard().unwrap();
+        assert_eq!(
+            clipboard.data.get("text/plain"),
+            Some(&b"hello from rdp".to_vec())
+        );
+        assert!(!clipboard.data.contains_key("text/plain;charset=utf-8"));
     }
 }

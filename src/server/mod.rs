@@ -1246,24 +1246,26 @@ impl LamcoRdpServer {
 
             match session_handle_for_clipboard.clipboard_source() {
                 ClipboardSource::Portal(_) => {
-                    // Portal strategy: use the portal_clipboard_manager wired above
-                    if let (Some(clipboard_mgr_arc), Some(session)) =
-                        (&portal_clipboard_manager, &portal_clipboard_session)
-                    {
-                        if uses_data_control {
-                            // ClipboardIntegrationMode overrides to data-control
-                            #[cfg(feature = "wl-clipboard")]
-                            {
-                                let provider =
-                                    crate::clipboard::providers::WlClipboardProvider::new();
-                                clipboard_mgr
-                                    .set_clipboard_provider(Arc::new(provider))
-                                    .await;
-                                info!(
-                                    "Clipboard provider: wl-clipboard-rs (data-control override)"
-                                );
-                            }
-                            #[cfg(not(feature = "wl-clipboard"))]
+                    // Portal RemoteDesktop can provide the video/input session while KDE lacks
+                    // org.freedesktop.portal.Clipboard.  If strategy selection chose direct
+                    // data-control, wire that provider even when the Portal Clipboard proxy is
+                    // unavailable; otherwise every RDP FormatList is dropped with
+                    // "No clipboard provider available".
+                    if uses_data_control {
+                        #[cfg(feature = "wl-clipboard")]
+                        {
+                            let provider = crate::clipboard::providers::WlClipboardProvider::new();
+                            clipboard_mgr
+                                .set_clipboard_provider(Arc::new(provider))
+                                .await;
+                            info!(
+                                "Clipboard provider: wl-clipboard-rs (data-control override; Portal clipboard not required)"
+                            );
+                        }
+                        #[cfg(not(feature = "wl-clipboard"))]
+                        {
+                            if let (Some(clipboard_mgr_arc), Some(session)) =
+                                (&portal_clipboard_manager, &portal_clipboard_session)
                             {
                                 let provider =
                                     crate::clipboard::providers::PortalClipboardProvider::new(
@@ -1277,21 +1279,30 @@ impl LamcoRdpServer {
                                     .set_clipboard_provider(Arc::new(provider))
                                     .await;
                                 info!("Clipboard provider: Portal (no wl-clipboard feature)");
+                            } else {
+                                warn!(
+                                    "Clipboard source is Portal and data-control selected, but neither wl-clipboard nor Portal Clipboard is available"
+                                );
                             }
-                        } else {
-                            let provider =
-                                crate::clipboard::providers::PortalClipboardProvider::new(
-                                    Arc::clone(clipboard_mgr_arc),
-                                    Arc::clone(session),
-                                    Arc::clone(&portal_session_valid),
-                                    config.clipboard.rate_limit_ms,
-                                )
-                                .await;
-                            clipboard_mgr
-                                .set_clipboard_provider(Arc::new(provider))
-                                .await;
-                            info!("Clipboard provider: Portal");
                         }
+                    } else if let (Some(clipboard_mgr_arc), Some(session)) =
+                        (&portal_clipboard_manager, &portal_clipboard_session)
+                    {
+                        let provider = crate::clipboard::providers::PortalClipboardProvider::new(
+                            Arc::clone(clipboard_mgr_arc),
+                            Arc::clone(session),
+                            Arc::clone(&portal_session_valid),
+                            config.clipboard.rate_limit_ms,
+                        )
+                        .await;
+                        clipboard_mgr
+                            .set_clipboard_provider(Arc::new(provider))
+                            .await;
+                        info!("Clipboard provider: Portal");
+                    } else {
+                        warn!(
+                            "Clipboard source is Portal but Portal Clipboard proxy is unavailable"
+                        );
                     }
                 }
                 ClipboardSource::Mutter(ref mutter_mgr) if !uses_data_control => {

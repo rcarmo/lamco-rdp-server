@@ -1955,6 +1955,21 @@ impl ClipboardOrchestrator {
                 {
                     warn!("Failed to provide eager-fetched text (charset): {e}");
                 }
+
+                // Data-control sources are synchronous: some backends snapshot
+                // available bytes at SetClipboard time, so updating source data
+                // after the initial empty announcement is not enough. Re-publish
+                // the text MIME list now that bytes are cached.
+                if provider.requires_upfront_data()
+                    && let Err(e) = provider
+                        .announce_formats(vec![
+                            "text/plain".to_string(),
+                            "text/plain;charset=utf-8".to_string(),
+                        ])
+                        .await
+                {
+                    warn!("Failed to re-announce eager-fetched text to data-control: {e}");
+                }
             } else {
                 debug!(
                     "Eager fetch: data too small ({} bytes), skipping",
