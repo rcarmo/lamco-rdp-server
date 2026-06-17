@@ -795,6 +795,34 @@ impl ClipboardProvider for WlClipboardProvider {
 
         debug!("wl-clipboard provider shut down");
     }
+
+    async fn write_text(&self, text: &str) -> crate::clipboard::error::Result<()> {
+        let bytes = text.as_bytes().to_vec();
+        tokio::task::spawn_blocking(move || {
+            let sources = vec![
+                wl_copy::MimeSource {
+                    source: wl_copy::Source::Bytes(bytes.clone().into_boxed_slice()),
+                    mime_type: wl_copy::MimeType::Specific("text/plain;charset=utf-8".to_string()),
+                },
+                wl_copy::MimeSource {
+                    source: wl_copy::Source::Bytes(bytes.into_boxed_slice()),
+                    mime_type: wl_copy::MimeType::Specific("text/plain".to_string()),
+                },
+            ];
+            let opts = wl_copy::Options::new();
+            wl_copy::copy_multi(opts, sources).map_err(|e| {
+                crate::clipboard::error::ClipboardError::PortalError(format!(
+                    "wl-clipboard write_text failed: {e}"
+                ))
+            })
+        })
+        .await
+        .map_err(|e| {
+            crate::clipboard::error::ClipboardError::PortalError(format!(
+                "write_text task panicked: {e}"
+            ))
+        })?
+    }
 }
 
 /// Check if a MIME type is a text type (used to predict which aliases

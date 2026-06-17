@@ -831,6 +831,22 @@ impl LamcoRdpServer {
                     .collect();
 
                 let (input_tx, input_rx) = tokio::sync::mpsc::channel(256);
+                #[cfg(feature = "wl-clipboard")]
+                let cjk_clipboard: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> =
+                    if config.input.cjk_paste_fallback {
+                        Some(Arc::new(
+                            crate::clipboard::providers::WlClipboardProvider::new(),
+                        ))
+                    } else {
+                        None
+                    };
+                #[cfg(not(feature = "wl-clipboard"))]
+                let cjk_clipboard: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> =
+                    None;
+                let cjk_paste_paused_flag = match &wlr_clipboard_manager {
+                    Some(mgr) => Some(mgr.lock().await.cjk_paste_paused()),
+                    None => None,
+                };
                 let input_handler = LamcoInputHandler::new(
                     session_handle.clone(),
                     monitors,
@@ -838,6 +854,9 @@ impl LamcoRdpServer {
                     input_tx,
                     input_rx,
                     shutdown_broadcast.subscribe(),
+                    config.input.cjk_paste_fallback,
+                    cjk_clipboard,
+                    cjk_paste_paused_flag,
                 )
                 .context("Failed to create wlr-direct input handler")?;
 
@@ -1158,6 +1177,20 @@ impl LamcoRdpServer {
 
         // HYBRID: For Mutter strategy, uses Portal for input while Mutter handles video
         let session_handle_for_clipboard = Arc::clone(&portal_input_handle);
+        #[cfg(feature = "wl-clipboard")]
+        let cjk_clipboard: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> =
+            if config.input.cjk_paste_fallback {
+                Some(Arc::new(
+                    crate::clipboard::providers::WlClipboardProvider::new(),
+                ))
+            } else {
+                None
+            };
+        #[cfg(not(feature = "wl-clipboard"))]
+        let cjk_clipboard: Option<Arc<dyn crate::clipboard::provider::ClipboardProvider>> = None;
+        // Create the CJK paste pause flag here so both the input handler and the
+        // ClipboardOrchestrator (created below) share the same Arc<AtomicBool>.
+        let cjk_paste_paused_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let input_handler = LamcoInputHandler::new(
             portal_input_handle, // Use Portal session for input (works on all DEs)
             monitors.clone(),
@@ -1165,6 +1198,9 @@ impl LamcoRdpServer {
             input_tx.clone(), // Multiplexer input queue sender (for handler callbacks)
             input_rx,         // Multiplexer input queue receiver (for batching task)
             shutdown_broadcast.subscribe(), // Shutdown signal for batching task
+            config.input.cjk_paste_fallback,
+            cjk_clipboard,
+            Some(Arc::clone(&cjk_paste_paused_flag)),
         )
         .context("Failed to create input handler")?;
 
@@ -1230,6 +1266,10 @@ impl LamcoRdpServer {
                 .context("Failed to create clipboard manager")?;
 
             clipboard_mgr.set_health_reporter(health_reporter.clone());
+
+            // Share the CJK paste pause flag with the input handler (created earlier).
+            // Must be set BEFORE initialize_strategy() which spawns the cooperation handler.
+            clipboard_mgr.set_cjk_paste_paused(cjk_paste_paused_flag);
 
             // Select clipboard strategy first — it drives provider choice
             let clipboard_strategy = crate::clipboard::ClipboardIntegrationMode::select(

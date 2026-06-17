@@ -27,7 +27,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
 };
 
 use lamco_clipboard_core::{
@@ -337,6 +337,15 @@ pub struct ClipboardOrchestrator {
     /// signal is an echo, not a new Linux-originated clipboard change, and must not be
     /// re-advertised back to Windows.
     last_rdp_provider_write_time: Arc<RwLock<Option<std::time::Instant>>>,
+
+    /// Flag to pause cooperation sync during CJK paste operations.
+    ///
+    /// When the CJK paste fallback writes text to clipboard + Ctrl+V, Klipper fires
+    /// clipboardHistoryUpdated. Without pausing, cooperation would sync this intermediate
+    /// clipboard state back to the client, causing "已复制" toasts for each character.
+    /// The input_handler sets this to true before write_text, and false after Ctrl+V +
+    /// clipboard restoration.
+    cjk_paste_paused: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// State for managing file transfers between Windows and Linux
@@ -603,6 +612,7 @@ impl ClipboardOrchestrator {
             cooperation_coordinator: Arc::new(RwLock::new(None)),
             cooperation_content_cache: Arc::new(RwLock::new(None)),
             last_rdp_provider_write_time: Arc::new(RwLock::new(None)),
+            cjk_paste_paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_broadcast: Arc::clone(&shutdown_broadcast),
             task_handles: Arc::clone(&task_handles),
         };
@@ -679,6 +689,7 @@ impl ClipboardOrchestrator {
         let sync_manager = Arc::clone(&self.sync_manager);
         let cooperation_content_cache = Arc::clone(&self.cooperation_content_cache);
         let last_rdp_provider_write_time = Arc::clone(&self.last_rdp_provider_write_time);
+        let cjk_paste_paused = Arc::clone(&self.cjk_paste_paused);
 
         let mut shutdown_rx = self.shutdown_broadcast.subscribe();
 
@@ -695,6 +706,16 @@ impl ClipboardOrchestrator {
                     } => {
                         debug!("📨 Cooperation: Klipper content updated ({}ms)", timestamp_ms);
 
+                        // Check if CJK paste operation is in progress.
+                        // When input_handler is doing clipboard write + Ctrl+V for IME input,
+                        // Klipper fires clipboardHistoryUpdated. We must skip these to avoid
+                        // the client showing "已复制" toast for each character typed.
+                        use std::sync::atomic::Ordering;
+                        if cjk_paste_paused.load(Ordering::Acquire) {
+                            info!("Cooperation: CJK paste in progress, skipping Klipper sync");
+                            continue;
+                        }
+
                         if let Some(last_write) = *last_rdp_provider_write_time.read().await {
                             let elapsed = last_write.elapsed();
                             if elapsed < std::time::Duration::from_secs(3) {
@@ -703,6 +724,21 @@ impl ClipboardOrchestrator {
                                     elapsed.as_millis()
                                 );
                                 continue;
+                            }
+                        }
+
+                        // Content dedup: skip if Klipper returns same content we already cached.
+                        // This prevents the client from showing "已复制" for unchanged clipboard.
+                        {
+                            let cached = cooperation_content_cache.read().await;
+                            if let Some(ref old) = *cached {
+                                if old == content.as_bytes() {
+                                    info!(
+                                        "Cooperation: Klipper content unchanged ({} chars), skipping re-announce",
+                                        content.len()
+                                    );
+                                    continue;
+                                }
                             }
                         }
 
@@ -803,6 +839,20 @@ impl ClipboardOrchestrator {
     ) {
         *self.server_event_sender.write().await = Some(sender);
         debug!(" ServerEvent sender registered with clipboard manager");
+    }
+
+    /// Get the CJK paste paused flag.
+    ///
+    /// The input_handler uses this to pause cooperation sync before writing to clipboard
+    /// Get a clone of the CJK paste pause flag.
+    /// Input handler uses this to pause cooperation sync during CJK clipboard-paste.
+    pub fn cjk_paste_paused(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cjk_paste_paused)
+    }
+
+    /// Replace the CJK paste pause flag with a shared one (e.g. created before the input handler).
+    pub fn set_cjk_paste_paused(&mut self, flag: Arc<AtomicBool>) {
+        self.cjk_paste_paused = flag;
     }
 
     /// Wire a health reporter so clipboard operations emit health events.
@@ -2427,13 +2477,17 @@ impl ClipboardOrchestrator {
         // Deliver converted data via clipboard provider
         let provider = provider_opt.as_ref().expect("provider checked above");
 
+        // Cache the delivered text BEFORE complete_transfer moves portal_data
+        let portal_data_cache = portal_data.clone();
+
         match provider
             .complete_transfer(serial, &requested_mime, portal_data, true)
             .await
         {
             Ok(()) => {
                 *last_rdp_provider_write_time.write().await = Some(std::time::Instant::now());
-                *cooperation_content_cache.write().await = None;
+                // Cache the delivered text so cooperation handler can dedup Klipper echoes
+                *cooperation_content_cache.write().await = Some(portal_data_cache);
                 info!(
                     "Clipboard data delivered via {} provider (serial {})",
                     provider.name(),

@@ -229,6 +229,15 @@ pub struct InputConfig {
 
     /// Enable touch input support
     pub enable_touch: bool,
+
+    /// Fall back to clipboard-paste (Ctrl+V) for CJK/non-ASCII Unicode characters
+    /// that cannot be injected via evdev keycodes or XKB keysyms.
+    ///
+    /// When true (default), consecutive non-ASCII Unicode input units are buffered
+    /// and flushed to the system clipboard, then a synthetic Ctrl+V is injected.
+    /// This handles CJK text from mobile IMEs on KDE where keysym injection fails.
+    #[serde(default = "default_true")]
+    pub cjk_paste_fallback: bool,
 }
 
 fn default_input_protocol() -> String {
@@ -286,6 +295,7 @@ impl Default for InputConfig {
             use_libei: None,
             keyboard_layout: "auto".to_string(),
             enable_touch: false,
+            cjk_paste_fallback: true,
         }
     }
 }
@@ -1468,6 +1478,7 @@ mod tests {
             use_libei: Some(true),
             keyboard_layout: "auto".to_string(),
             enable_touch: false,
+            cjk_paste_fallback: true,
         };
         assert_eq!(config.effective_protocol(), "libei");
 
@@ -1477,6 +1488,7 @@ mod tests {
             use_libei: Some(false),
             keyboard_layout: "auto".to_string(),
             enable_touch: false,
+            cjk_paste_fallback: true,
         };
         assert_eq!(config.effective_protocol(), "wlr");
 
