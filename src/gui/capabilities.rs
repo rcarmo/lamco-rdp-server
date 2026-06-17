@@ -259,8 +259,9 @@ fn parse_deployment_context(context: &str, linger: Option<bool>) -> DeploymentCo
 fn derive_auth_methods(services: &[ServiceInfo]) -> Vec<String> {
     let mut methods = Vec::new();
 
-    // "none" is always available and is the default
+    // "none" and static username/password are always available.
     methods.push("none".to_string());
+    methods.push("password".to_string());
 
     // Check if PAM authentication is available (at least Degraded level)
     let pam_available = services.iter().any(|s| {

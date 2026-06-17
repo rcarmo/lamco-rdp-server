@@ -67,6 +67,10 @@ pub enum Message {
     SecurityModeChanged(String),
     /// Auth method changed
     SecurityAuthMethodChanged(String),
+    /// Static password auth username changed
+    SecurityPasswordUsernameChanged(String),
+    /// Static password auth password changed
+    SecurityPasswordChanged(String),
     /// Require TLS 1.3 toggled
     SecurityRequireTls13Toggled(bool),
 

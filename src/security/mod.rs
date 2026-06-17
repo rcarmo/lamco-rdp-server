@@ -122,7 +122,10 @@ pub mod auth;
 pub mod certificates;
 pub mod tls;
 
-pub use auth::{AuthMethod, PamValidator, SessionToken, UserAuthenticator};
+pub use auth::{
+    AuthMethod, PamValidator, SessionToken, StaticPasswordValidator, UserAuthenticator,
+    hash_static_password, validate_username,
+};
 pub use certificates::CertificateGenerator;
 pub use tls::TlsConfig;
 

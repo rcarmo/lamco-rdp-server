@@ -23,7 +23,9 @@ use crate::{
         message::{DamageTrackingPreset, EgfxPreset, Message, PerformancePreset},
         server_connection::{ConnectionMode, ServerConnection},
         server_process::ServerLogLine,
-        state::{AppState, CertGenState, LogLevel, LogLine, MessageLevel, Tab, TabCategory},
+        state::{
+            AppState, CertGenState, EditStrings, LogLevel, LogLine, MessageLevel, Tab, TabCategory,
+        },
         tabs, theme as app_theme,
     },
 };
@@ -109,30 +111,20 @@ impl ConfigGuiApp {
             }
 
             Message::ServerListenAddrChanged(addr) => {
-                // Reconstruct full address with existing port
-                let port = self
-                    .state
-                    .config
-                    .server
-                    .listen_addr
-                    .rsplit(':')
-                    .next()
-                    .unwrap_or("3389");
-                self.state.config.server.listen_addr = format!("{}:{}", addr, port);
+                self.state.edit_strings.server_ip = addr;
+                self.state.config.server.listen_addr = EditStrings::compose_listen_addr(
+                    &self.state.edit_strings.server_ip,
+                    &self.state.edit_strings.server_port,
+                );
                 self.state.mark_dirty();
                 Task::none()
             }
             Message::ServerPortChanged(port) => {
-                // Reconstruct full address with existing IP
-                let ip = self
-                    .state
-                    .config
-                    .server
-                    .listen_addr
-                    .rsplit_once(':')
-                    .map(|(ip, _)| ip)
-                    .unwrap_or("0.0.0.0");
-                self.state.config.server.listen_addr = format!("{}:{}", ip, port);
+                self.state.edit_strings.server_port = port;
+                self.state.config.server.listen_addr = EditStrings::compose_listen_addr(
+                    &self.state.edit_strings.server_ip,
+                    &self.state.edit_strings.server_port,
+                );
                 self.state.mark_dirty();
                 Task::none()
             }
@@ -294,6 +286,50 @@ impl ConfigGuiApp {
             Message::SecurityAuthMethodChanged(method) => {
                 self.state.config.security.auth_method = method;
                 self.state.mark_dirty();
+                Task::none()
+            }
+            Message::SecurityPasswordUsernameChanged(username) => {
+                self.state.edit_strings.password_username = username.clone();
+                // The username field selects which entry in password_credentials
+                // will be added/updated when a new password is entered.
+                self.state.mark_dirty();
+                Task::none()
+            }
+            Message::SecurityPasswordChanged(password) => {
+                self.state.edit_strings.password = password.clone();
+                let username = self.state.edit_strings.password_username.trim().to_string();
+                if password.is_empty() {
+                    if !username.is_empty() {
+                        self.state
+                            .config
+                            .security
+                            .password_credentials
+                            .remove(&username);
+                    }
+                    self.state.mark_dirty();
+                } else if username.is_empty() {
+                    self.state.add_message(
+                        MessageLevel::Error,
+                        "Enter a username before setting a password".to_string(),
+                    );
+                } else {
+                    match crate::security::hash_static_password(&password) {
+                        Ok(hash) => {
+                            self.state
+                                .config
+                                .security
+                                .password_credentials
+                                .insert(username, hash);
+                            self.state.mark_dirty();
+                        }
+                        Err(e) => {
+                            self.state.add_message(
+                                MessageLevel::Error,
+                                format!("Failed to hash password: {e}"),
+                            );
+                        }
+                    }
+                }
                 Task::none()
             }
             Message::SecurityRequireTls13Toggled(val) => {

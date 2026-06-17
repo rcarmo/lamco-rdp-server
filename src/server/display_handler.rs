@@ -567,6 +567,15 @@ impl LamcoDisplayHandler {
         info!("Client disconnect signaled to pipeline - frame processing paused");
     }
 
+    /// Whether a client is currently marked active by the display pipeline.
+    ///
+    /// mstsc can open extra short-lived probe/retry TCP connections while the
+    /// authenticated session is active. Those failed probe connections must not
+    /// clear the active session's pipeline state.
+    pub fn is_client_active(&self) -> bool {
+        self.client_active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Set graphics queue sender for priority multiplexing
     ///
     /// When set, frames will be routed through the graphics queue instead of

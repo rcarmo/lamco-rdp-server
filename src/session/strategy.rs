@@ -96,6 +96,11 @@ pub trait SessionHandle: Send + Sync {
 
     async fn notify_keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<()>;
 
+    async fn notify_keyboard_keysym(&self, keysym: i32, pressed: bool) -> Result<()> {
+        let _ = (keysym, pressed);
+        anyhow::bail!("Keyboard keysym injection is not available for this session strategy")
+    }
+
     async fn notify_pointer_motion_absolute(&self, stream_id: u32, x: f64, y: f64) -> Result<()>;
 
     async fn notify_pointer_button(&self, button: i32, pressed: bool) -> Result<()>;

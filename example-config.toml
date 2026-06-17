@@ -36,22 +36,36 @@ cert_path = "/etc/lamco-rdp-server/cert.pem"
 # Same directory as certificate
 key_path = "/etc/lamco-rdp-server/key.pem"
 
-# Enable Network Level Authentication (requires auth_method = "pam")
-# NLA authenticates before establishing the RDP session
+# Enable Network Level Authentication (legacy; prefer security_mode = "hybrid")
+# NLA authenticates before establishing the RDP session. It requires a credential
+# backend that can provide plaintext/equivalent server-side credentials.
 enable_nla = false
 
+# Security mode: "auto", "tls", or "hybrid"
+security_mode = "auto"
+
 # Authentication method:
-#   "none" - No authentication required (default)
-#            Anyone who can reach the server can view your desktop.
-#            Appropriate for: personal use, trusted networks, Flatpak.
-#   "pam"  - PAM authentication against system accounts
-#            Requires valid system username/password to connect.
-#            Only available in native installs (not Flatpak).
-#            If configured but unavailable, falls back to "none" with warning.
+#   "none"     - No authentication required (default)
+#                Anyone who can reach the server can view your desktop.
+#                Appropriate for: personal use, trusted networks, Flatpak.
+#   "password" - Custom RDP-only username/password entries from this config file.
+#                Stored as Argon2id hashes in [security.password_credentials]
+#                and works with TLS-only mode.
+#                Hybrid/NLA needs plaintext/equivalent CredSSP credentials and
+#                is intentionally not supported with Argon2id password hashes.
+#   "pam"      - PAM authentication against system accounts.
+#                Requires TLS-only mode because PAM validates received passwords.
 auth_method = "none"
 
 # Require TLS 1.3 (more secure but may have compatibility issues)
 require_tls_13 = false
+
+# Used when auth_method = "password". Keys are RDP-only usernames (not Linux
+# accounts), values are Argon2id PHC password hashes. The GUI hashes passwords
+# before saving; plaintext passwords are never stored.
+[security.password_credentials]
+# alice = "$argon2id$v=19$m=19456,t=2,p=1$..."
+# bob = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
 # =============================================================================
 # Video Configuration

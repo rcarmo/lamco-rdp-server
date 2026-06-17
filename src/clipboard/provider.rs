@@ -100,6 +100,15 @@ pub trait ClipboardProvider: Send + Sync {
 
     /// Shut down the provider (stop listeners, release resources).
     async fn shutdown(&self);
+
+    /// Write plain UTF-8 text to the system clipboard.
+    ///
+    /// Best-effort: providers that don't support direct writes return Ok(())
+    /// without doing anything. Used by the CJK paste fallback to prime the
+    /// clipboard before synthesizing Ctrl+V.
+    async fn write_text(&self, _text: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

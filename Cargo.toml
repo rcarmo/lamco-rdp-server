@@ -1,6 +1,6 @@
 [package]
 name = "lamco-rdp-server"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Greg Lamberson <greg@lamco.io>"]
@@ -200,6 +200,7 @@ dirs = "6.0"
 # Cryptography (for session token encryption)
 # -----------------------------------------------------------------------------
 aes-gcm = "0.10"
+argon2 = "0.5"
 
 # -----------------------------------------------------------------------------
 # Credential Storage Backends

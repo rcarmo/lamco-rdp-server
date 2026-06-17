@@ -148,6 +148,21 @@ impl SessionStrategySelector {
                 ));
             }
 
+            DeploymentContext::SystemdUser { .. } => {
+                // Systemd user services should avoid the libei input-only strategy on KDE:
+                // it creates a second standalone ScreenCast portal session for video, which
+                // can trigger source-selection prompts on every restart. Prefer a single
+                // Portal RemoteDesktop session so the configured host app-id/permission-store
+                // identity has the best chance to reuse authorization.
+                info!("Systemd user deployment: using Portal + Token strategy");
+                info!("Avoiding libei input-only + standalone ScreenCast startup prompt");
+
+                return Ok(Box::new(PortalTokenStrategy::new(
+                    self.service_registry.clone(),
+                    self.token_manager.clone(),
+                )));
+            }
+
             DeploymentContext::SystemdSystem => {
                 // System service: Limited to portal (D-Bus session complexity)
                 warn!("System service deployment: Limited to Portal strategy");
@@ -160,7 +175,7 @@ impl SessionStrategySelector {
             }
 
             _ => {
-                // Native, SystemdUser, InitD - full strategy access
+                // Native, InitD - full strategy access
                 debug!("Unrestricted deployment, checking all strategies");
             }
         }

@@ -1,3 +1,19 @@
+lamco-rdp-server (1.4.3-1) unstable; urgency=medium
+
+  * feat: Add static password authentication with multi-user support
+  * feat: Add IPv6 listen address support
+  * feat: Add Portal host app identity registration for KDE compatibility
+  * fix: Restore KDE clipboard sync via data-control/wl-clipboard provider
+  * fix: Cache RDP clipboard text for data-control backends
+  * fix: Route CJK input via Portal keysym injection for BMP characters
+  * fix: Pause Klipper cooperation sync during CJK clipboard-paste fallback
+    - Prevents "已复制" toast spam during Chinese/Japanese/Korean typing
+    - Preserves original clipboard content after CJK paste operations
+    - Shares cjk_paste_paused flag between input handler and ClipboardOrchestrator
+  * fix: Handle Portal + Token strategy for systemd user deployments
+
+ -- Greg Lamberson <greg@lamco.io>  Tue, 17 Jun 2026 10:00:00 +0000
+
 lamco-rdp-server (1.4.2-1) unstable; urgency=medium
 
   * New upstream release

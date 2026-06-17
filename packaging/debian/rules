@@ -17,6 +17,7 @@ override_dh_auto_install:
 	install -Dm755 target/release/lamco-rdp-server debian/lamco-rdp-server/usr/bin/lamco-rdp-server
 	install -Dm755 target/release/lamco-rdp-server-gui debian/lamco-rdp-server/usr/bin/lamco-rdp-server-gui
 	install -Dm644 packaging/systemd/lamco-rdp-server.service debian/lamco-rdp-server/usr/lib/systemd/user/lamco-rdp-server.service
+	install -Dm644 packaging/pam/lamco-rdp-server debian/lamco-rdp-server/etc/pam.d/lamco-rdp-server
 	install -dm755 debian/lamco-rdp-server/etc/lamco-rdp-server
 	install -Dm644 data/io.lamco.rdp-server.desktop debian/lamco-rdp-server/usr/share/applications/io.lamco.rdp-server.desktop
 	install -Dm644 data/io.lamco.rdp-server.metainfo.xml debian/lamco-rdp-server/usr/share/metainfo/io.lamco.rdp-server.metainfo.xml

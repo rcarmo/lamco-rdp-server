@@ -271,6 +271,9 @@ impl ServiceRegistry {
     pub fn available_auth_methods(&self) -> Vec<&'static str> {
         let mut methods = vec![];
 
+        // Static username/password auth is implemented in-process and always available.
+        methods.push("password");
+
         if self.service_level(ServiceId::PamAuthentication) >= ServiceLevel::Degraded {
             methods.push("pam");
         }

@@ -18,7 +18,7 @@ use ashpd::desktop::{
 };
 use enumflags2::BitFlags;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Check if running inside a Flatpak sandbox
 pub fn is_flatpak() -> bool {
@@ -88,7 +88,8 @@ pub mod types;
 use types::{
     AdvancedVideoConfig, CaptureProtocolConfig, ClipboardConfig, DamageTrackingConfig,
     DisplayConfig, EgfxConfig, InputConfig, LoggingConfig, MultiMonitorConfig, NotificationConfig,
-    PerformanceConfig, SecurityConfig, ServerConfig, VideoConfig, VideoPipelineConfig,
+    PerformanceConfig, PortalConfig, SecurityConfig, ServerConfig, VideoConfig,
+    VideoPipelineConfig,
 };
 pub use types::{
     AudioConfig, CursorConfig, CursorPredictorConfig, GuiStateConfig, HardwareEncodingConfig,
@@ -110,6 +111,9 @@ pub struct Config {
     /// Server configuration
     #[serde(default)]
     pub server: ServerConfig,
+    /// XDG Desktop Portal application identity configuration
+    #[serde(default)]
+    pub portal: PortalConfig,
     /// Security configuration
     #[serde(default)]
     pub security: SecurityConfig,
@@ -323,11 +327,42 @@ impl Config {
         }
 
         match self.security.auth_method.as_str() {
-            "none" | "pam" => {}
+            "none" | "pam" | "password" => {}
             _ => anyhow::bail!(
-                "Invalid auth_method: {} (expected none or pam)",
+                "Invalid auth_method: {} (expected none, pam, or password)",
                 self.security.auth_method
             ),
+        }
+
+        if self.security.auth_method == "password" {
+            if !self.security.password.is_empty() {
+                anyhow::bail!(
+                    "security.password is deprecated and unsafe; use security.password_credentials"
+                );
+            }
+            if !self.security.password_username.is_empty()
+                || !self.security.password_hash.is_empty()
+            {
+                anyhow::bail!(
+                    "security.password_username/password_hash are deprecated; use security.password_credentials"
+                );
+            }
+            if self.security.password_credentials.is_empty() {
+                anyhow::bail!("auth_method=password requires security.password_credentials");
+            }
+            for (username, password_hash) in &self.security.password_credentials {
+                crate::security::validate_username(username).with_context(|| {
+                    format!("Invalid password credential username '{username}'")
+                })?;
+                argon2::password_hash::PasswordHash::new(password_hash).map_err(|e| {
+                    anyhow::anyhow!("Invalid password hash for user '{username}': {e}")
+                })?;
+            }
+            if self.security.security_mode == "hybrid" {
+                anyhow::bail!(
+                    "password_credentials cannot be used with security_mode=hybrid; use security_mode=tls or auto"
+                );
+            }
         }
 
         match self.security.security_mode.as_str() {
@@ -351,6 +386,12 @@ impl Config {
         match self.video.cursor_mode.as_str() {
             "embedded" | "metadata" | "hidden" => {}
             _ => anyhow::bail!("Invalid cursor mode: {}", self.video.cursor_mode),
+        }
+
+        if let Some(app_id) = self.portal.app_id.as_deref() {
+            app_id
+                .parse::<ashpd::AppID>()
+                .with_context(|| format!("Invalid portal.app_id: {app_id}"))?;
         }
 
         match self.cursor.mode.as_str() {
@@ -449,11 +490,56 @@ impl Config {
         }
     }
 
+    /// Register the configured native process app-id with xdg-desktop-portal.
+    ///
+    /// This must happen before creating portal proxies/sessions. It lets the
+    /// portal backend associate this process' D-Bus unique name with a stable
+    /// app-id, so grants are looked up consistently across restarts.
+    pub async fn register_portal_app_id(&self) {
+        let Some(app_id) = self.portal.app_id.as_deref() else {
+            return;
+        };
+
+        if !self.portal.register_host_app {
+            debug!(
+                app_id,
+                "portal app-id configured but host-app registration disabled"
+            );
+            return;
+        }
+
+        let parsed = match app_id.parse::<ashpd::AppID>() {
+            Ok(app_id) => app_id,
+            Err(e) => {
+                warn!(app_id, error = %e, "invalid portal app-id; skipping host-app registration");
+                return;
+            }
+        };
+
+        match ashpd::register_host_app(parsed).await {
+            Ok(()) => info!(app_id, "registered native portal app-id"),
+            Err(e) => warn!(
+                app_id,
+                error = %e,
+                "failed to register native portal app-id; portal may still show permission dialogs"
+            ),
+        }
+    }
+
     /// Override config with CLI arguments
-    pub fn with_overrides(mut self, listen: Option<String>, port: u16) -> Self {
+    pub fn with_overrides(mut self, listen: Option<String>, port: Option<u16>) -> Self {
         if let Some(listen_addr) = listen {
+            let port = port.unwrap_or_else(|| {
+                self.server
+                    .listen_addr
+                    .parse::<SocketAddr>()
+                    .map(|addr| addr.port())
+                    .unwrap_or(3389)
+            });
             self.server.listen_addr = format!("{listen_addr}:{port}");
-        } else if let Ok(mut addr) = self.server.listen_addr.parse::<SocketAddr>() {
+        } else if let Some(port) = port
+            && let Ok(mut addr) = self.server.listen_addr.parse::<SocketAddr>()
+        {
             addr.set_port(port);
             self.server.listen_addr = addr.to_string();
         }
@@ -501,6 +587,7 @@ impl Default for Config {
         Self {
             config_version: CURRENT_CONFIG_VERSION,
             server: ServerConfig::default(),
+            portal: PortalConfig::default(),
             security: SecurityConfig::default(),
             video: VideoConfig::default(),
             video_pipeline: VideoPipelineConfig::default(),
@@ -564,6 +651,103 @@ mod tests {
         let mut config = Config::default_config().unwrap();
         config.video.cursor_mode = "invalid_mode".to_string();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_password_auth_requires_static_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, "test cert").unwrap();
+        std::fs::write(&key_path, "test key").unwrap();
+
+        let mut config = Config::default_config().unwrap();
+        config.security.cert_path = cert_path;
+        config.security.key_path = key_path;
+        config.security.auth_method = "password".to_string();
+        config.security.security_mode = "tls".to_string();
+
+        assert!(config.validate().is_err());
+
+        config.security.password_credentials.insert(
+            "rdpuser".to_string(),
+            crate::security::hash_static_password("secret").unwrap(),
+        );
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_password_auth_accepts_multiple_static_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, "test cert").unwrap();
+        std::fs::write(&key_path, "test key").unwrap();
+
+        let mut config = Config::default_config().unwrap();
+        config.security.cert_path = cert_path;
+        config.security.key_path = key_path;
+        config.security.auth_method = "password".to_string();
+        config.security.security_mode = "tls".to_string();
+        config.security.password_credentials.insert(
+            "alice".to_string(),
+            crate::security::hash_static_password("alice-secret").unwrap(),
+        );
+        config.security.password_credentials.insert(
+            "bob".to_string(),
+            crate::security::hash_static_password("bob-secret").unwrap(),
+        );
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_password_auth_rejects_hybrid_mode_without_plaintext_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, "test cert").unwrap();
+        std::fs::write(&key_path, "test key").unwrap();
+
+        let mut config = Config::default_config().unwrap();
+        config.security.cert_path = cert_path;
+        config.security.key_path = key_path;
+        config.security.auth_method = "password".to_string();
+        config.security.security_mode = "hybrid".to_string();
+        config.security.password_credentials.insert(
+            "rdpuser".to_string(),
+            crate::security::hash_static_password("secret").unwrap(),
+        );
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("password_credentials cannot be used with security_mode=hybrid"));
+    }
+
+    #[test]
+    fn test_with_overrides_without_cli_port_preserves_listen_addr() {
+        let config = Config::default_config().unwrap();
+        let config = config.with_overrides(None, None);
+
+        assert_eq!(config.server.listen_addr, "0.0.0.0:3389");
+    }
+
+    #[test]
+    fn test_with_overrides_without_cli_port_preserves_ipv6_listen_addr() {
+        let mut config = Config::default_config().unwrap();
+        config.server.listen_addr = "[::1]:3389".to_string();
+
+        let config = config.with_overrides(None, None);
+
+        assert_eq!(config.server.listen_addr, "[::1]:3389");
+    }
+
+    #[test]
+    fn test_with_overrides_cli_port_updates_existing_host_only() {
+        let config = Config::default_config().unwrap();
+        let config = config.with_overrides(None, Some(3390));
+
+        assert_eq!(config.server.listen_addr, "0.0.0.0:3390");
     }
 
     #[test]

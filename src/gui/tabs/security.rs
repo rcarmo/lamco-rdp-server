@@ -11,7 +11,7 @@ use crate::gui::{message::Message, state::AppState, theme, widgets, widgets::spa
 
 /// Default authentication methods (used when capabilities not yet detected)
 /// "none" is first as it's the default and always available
-const DEFAULT_AUTH_METHODS: &[&str] = &["none", "pam"];
+const DEFAULT_AUTH_METHODS: &[&str] = &["none", "password", "pam"];
 
 /// Get available authentication methods based on detected capabilities
 ///
@@ -37,10 +37,10 @@ fn get_auth_methods(state: &AppState) -> Vec<&str> {
 fn auth_method_help_text(state: &AppState) -> &'static str {
     if let Some(ref caps) = state.detected_capabilities {
         if caps.available_auth_methods.contains(&"pam".to_string()) {
-            "PAM = system authentication, None = no password required"
+            "Password = custom RDP username/password, PAM = system authentication, None = no password required"
         } else {
             // PAM unavailable (likely Flatpak)
-            "PAM unavailable in this deployment. None = no password required"
+            "Password = custom RDP username/password, None = no password required"
         }
     } else {
         // Capabilities not yet detected
@@ -137,6 +137,67 @@ pub fn view_security_tab(state: &AppState) -> Element<'_, Message> {
             .into(),
             auth_method_help_text(state),
         ),
+        space().height(16.0),
+        // Static username/password credentials
+        if state.config.security.auth_method == "password" {
+            widgets::section_header("Custom Username/Password")
+        } else {
+            text("").into()
+        },
+        if state.config.security.auth_method == "password" {
+            let users = if state.config.security.password_credentials.is_empty() {
+                "Configured users: none yet".to_string()
+            } else {
+                format!(
+                    "Configured users: {}",
+                    state
+                        .config
+                        .security
+                        .password_credentials
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            widgets::labeled_row_with_help(
+                "Users:",
+                150.0,
+                text(users).width(Length::Fixed(360.0)).into(),
+                "Each saved username maps to one Argon2id password hash",
+            )
+        } else {
+            text("").into()
+        },
+        if state.config.security.auth_method == "password" {
+            widgets::labeled_row_with_help(
+                "Username:",
+                150.0,
+                text_input("rdpuser", &state.edit_strings.password_username)
+                    .on_input(Message::SecurityPasswordUsernameChanged)
+                    .width(Length::Fixed(220.0))
+                    .style(theme::text_input_style)
+                    .into(),
+                "RDP-only username. Enter a password below to add/update this user; clear the password to remove it.",
+            )
+        } else {
+            text("").into()
+        },
+        if state.config.security.auth_method == "password" {
+            widgets::labeled_row_with_help(
+                "Password:",
+                150.0,
+                text_input("password", &state.edit_strings.password)
+                    .secure(true)
+                    .on_input(Message::SecurityPasswordChanged)
+                    .width(Length::Fixed(220.0))
+                    .style(theme::text_input_style)
+                    .into(),
+                "Saved under security.password_credentials as an Argon2id hash; plaintext is not stored",
+            )
+        } else {
+            text("").into()
+        },
         space().height(16.0),
         // Require TLS 1.3
         widgets::toggle_with_help(

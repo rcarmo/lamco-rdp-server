@@ -85,6 +85,60 @@ use ironrdp_server::{
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
+/// Accumulates non-ASCII Unicode input units for clipboard-paste fallback.
+///
+/// RDP sends CJK input as a stream of UnicodePressed events. Since keysym
+/// injection fails for many CJK characters on KDE, we buffer them and flush
+/// via write_text + Ctrl+V when a non-Unicode event (keycode) arrives.
+struct CjkPasteBuffer {
+    buf: String,
+    pending_high_surrogate: Option<u16>,
+}
+
+impl CjkPasteBuffer {
+    fn new() -> Self {
+        Self {
+            buf: String::new(),
+            pending_high_surrogate: None,
+        }
+    }
+
+    fn push_char(&mut self, c: char) {
+        self.buf.push(c);
+    }
+
+    /// Decode a UTF-16 surrogate pair and push the resulting char.
+    /// Returns the decoded char if the pair is complete, None if `high` was stored
+    /// waiting for a low surrogate, or None if the pair is invalid.
+    fn push_surrogate_pair(&mut self, high: u16, low: u16) -> Option<char> {
+        if !(0xD800..=0xDBFF).contains(&high) || !(0xDC00..=0xDFFF).contains(&low) {
+            self.pending_high_surrogate = None;
+            return None;
+        }
+        let code_point =
+            0x10000 + (u32::from(high - 0xD800) << 10) + u32::from(low - 0xDC00);
+        let c = char::from_u32(code_point)?;
+        self.buf.push(c);
+        self.pending_high_surrogate = None;
+        Some(c)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty() && self.pending_high_surrogate.is_none()
+    }
+
+    /// Drain buffered text. Returns None if nothing was accumulated.
+    fn take_text(&mut self) -> Option<String> {
+        self.pending_high_surrogate = None;
+        if self.buf.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.buf))
+        }
+    }
+}
+
+use crate::clipboard::provider::ClipboardProvider;
 use crate::input::{
     CoordinateTransformer, InputError, KeyboardHandler, MonitorInfo, MouseButton, MouseHandler,
 };
@@ -259,6 +313,21 @@ fn unicode_to_evdev(cp: u16) -> Option<(u32, bool)> {
     }
 }
 
+/// Convert an RDP Unicode input code unit into an XKB keysym.
+///
+/// X11/XKB represents Unicode characters outside Latin-1 as `0x01000000 | codepoint`.
+/// RDP Unicode input delivers UTF-16 code units; the current IronRDP server API exposes
+/// each unit as `u16`, so supplementary-plane characters that require surrogate pairs
+/// cannot be represented as a single keysym here.
+fn unicode_to_keysym(cp: u16) -> Option<i32> {
+    match cp {
+        0xD800..=0xDFFF => None,
+        0x0000..=0x001F | 0x007F..=0x009F => None,
+        0x0020..=0x00FF => Some(i32::from(cp)),
+        _ => Some((0x0100_0000u32 | u32::from(cp)) as i32),
+    }
+}
+
 fn portal_err(e: impl std::fmt::Display) -> InputError {
     InputError::PortalError(e.to_string())
 }
@@ -302,6 +371,16 @@ pub struct LamcoInputHandler {
 
     /// Input event queue sender (for multiplexer - bounded with drop policy)
     input_tx: mpsc::Sender<InputEvent>,
+
+    /// Whether CJK clipboard-paste fallback is enabled (from config)
+    cjk_paste_enabled: bool,
+
+    /// Clipboard provider for writing text during CJK paste fallback
+    clipboard_provider: Option<Arc<dyn ClipboardProvider>>,
+
+    /// Flag to pause cooperation sync during CJK paste operations.
+    /// When set to true, the cooperation event handler skips Klipper sync events.
+    cjk_paste_paused: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl LamcoInputHandler {
@@ -312,6 +391,9 @@ impl LamcoInputHandler {
         input_tx: mpsc::Sender<InputEvent>,
         mut input_rx: mpsc::Receiver<InputEvent>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+        cjk_paste_enabled: bool,
+        clipboard_provider: Option<Arc<dyn ClipboardProvider>>,
+        cjk_paste_paused: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<Self, InputError> {
         let keyboard_handler = Arc::new(Mutex::new(KeyboardHandler::new()));
         let mouse_handler = Arc::new(Mutex::new(MouseHandler::new()));
@@ -329,12 +411,16 @@ impl LamcoInputHandler {
         let keyboard_clone = Arc::clone(&keyboard_handler);
         let mouse_clone = Arc::clone(&mouse_handler);
         let coord_clone = Arc::clone(&coordinate_transformer);
+        let cjk_enabled_task = cjk_paste_enabled;
+        let clipboard_provider_task = clipboard_provider.clone();
+        let cjk_paste_paused_task = cjk_paste_paused.clone();
 
         tokio::spawn(async move {
             let mut keyboard_batch = Vec::with_capacity(16);
             let mut mouse_batch = Vec::with_capacity(16);
             let mut last_flush = Instant::now();
             let batch_interval = tokio::time::Duration::from_millis(10);
+            let mut cjk_buffer = CjkPasteBuffer::new();
 
             // Rate-limit input injection errors to avoid log spam when the
             // portal session becomes unresponsive (e.g. PipeWire stream pauses)
@@ -365,7 +451,11 @@ impl LamcoInputHandler {
                             if let Err(e) = Self::handle_keyboard_event_impl(
                                 &session_handle_clone,
                                 &keyboard_clone,
-                                kbd_event
+                                kbd_event,
+                                &mut cjk_buffer,
+                                cjk_enabled_task,
+                                &clipboard_provider_task,
+                                &cjk_paste_paused_task,
                             ).await {
                                 let count = consecutive_kbd_errors.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count == 1 {
@@ -437,6 +527,9 @@ impl LamcoInputHandler {
             coordinate_transformer,
             primary_stream_id,
             input_tx,
+            cjk_paste_enabled,
+            clipboard_provider,
+            cjk_paste_paused,
         })
     }
 
@@ -478,11 +571,22 @@ impl LamcoInputHandler {
         session_handle: &Arc<dyn crate::session::SessionHandle>,
         keyboard_handler: &Arc<Mutex<KeyboardHandler>>,
         event: IronKeyboardEvent,
+        cjk_buffer: &mut CjkPasteBuffer,
+        cjk_paste_enabled: bool,
+        clipboard_provider: &Option<Arc<dyn ClipboardProvider>>,
+        cjk_paste_paused: &Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), InputError> {
         let mut keyboard = keyboard_handler.lock().await;
 
         match event {
             IronKeyboardEvent::Pressed { code, extended } => {
+                // Flush any buffered CJK text before a regular keycode event
+                if !cjk_buffer.is_empty() {
+                    drop(keyboard);
+                    Self::flush_cjk_buffer(session_handle, cjk_buffer, clipboard_provider, cjk_paste_paused).await;
+                    keyboard = keyboard_handler.lock().await;
+                }
+
                 // Log V key specifically to trace Ctrl+V paste operations
                 if code == 0x2F {
                     // V key scancode
@@ -587,33 +691,83 @@ impl LamcoInputHandler {
                         .notify_keyboard_keycode(keycode as i32, true)
                         .await
                         .map_err(portal_err)?;
+                } else if cjk_paste_enabled {
+                    // KDE/xdg-desktop-portal-kde cannot turn CJK Unicode keysyms into
+                    // physical keycodes, so do not try keysym injection for non-ASCII
+                    // Unicode here. Buffer the committed text and paste it immediately.
+                    if (0xD800..=0xDBFF).contains(&unicode) {
+                        cjk_buffer.pending_high_surrogate = Some(unicode);
+                        debug!("Unicode press 0x{:04X}: stored high surrogate for CJK paste", unicode);
+                    } else if (0xDC00..=0xDFFF).contains(&unicode) {
+                        if let Some(high) = cjk_buffer.pending_high_surrogate.take() {
+                            if cjk_buffer.push_surrogate_pair(high, unicode).is_some() {
+                                info!("Unicode press surrogate pair 0x{:04X}+0x{:04X}: buffered for CJK paste", high, unicode);
+                                drop(keyboard);
+                                Self::flush_cjk_buffer(session_handle, cjk_buffer, clipboard_provider, cjk_paste_paused).await;
+                            } else {
+                                debug!("Unicode press 0x{:04X}: invalid surrogate pair, discarding", unicode);
+                            }
+                        } else {
+                            debug!("Unicode press 0x{:04X}: lone low surrogate, discarding", unicode);
+                        }
+                    } else if let Some(c) = char::from_u32(u32::from(unicode)) {
+                        cjk_buffer.push_char(c);
+                        info!("Unicode press 0x{:04X}: buffered for CJK paste", unicode);
+                        drop(keyboard);
+                        Self::flush_cjk_buffer(session_handle, cjk_buffer, clipboard_provider, cjk_paste_paused).await;
+                    } else {
+                        debug!("Unicode press 0x{:04X}: no mapping, discarding", unicode);
+                    }
+                } else if let Some(keysym) = unicode_to_keysym(unicode) {
+                    debug!(
+                        "Unicode press 0x{:04X} -> XKB keysym 0x{:08X}",
+                        unicode, keysym
+                    );
+                    session_handle
+                        .notify_keyboard_keysym(keysym, true)
+                        .await
+                        .map_err(portal_err)?;
                 } else {
                     debug!(
-                        "Unicode press 0x{:04X}: no evdev mapping (non-ASCII or unmapped)",
+                        "Unicode press 0x{:04X}: no evdev or keysym mapping",
                         unicode
                     );
                 }
             }
 
             IronKeyboardEvent::UnicodeReleased(unicode) => {
-                if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
+                // Skip release events for chars that were buffered into the CJK buffer
+                // (they have no corresponding keycode to release)
+                if unicode_to_evdev(unicode).is_some() {
                     debug!(
-                        "Unicode release 0x{:04X} -> evdev {} (shift={})",
-                        unicode, keycode, needs_shift
+                        "Unicode release 0x{:04X} -> evdev",
+                        unicode
                     );
-                    session_handle
-                        .notify_keyboard_keycode(keycode as i32, false)
-                        .await
-                        .map_err(portal_err)?;
-                    if needs_shift {
+                    if let Some((keycode, needs_shift)) = unicode_to_evdev(unicode) {
                         session_handle
-                            .notify_keyboard_keycode(42, false)
+                            .notify_keyboard_keycode(keycode as i32, false)
                             .await
                             .map_err(portal_err)?;
+                        if needs_shift {
+                            session_handle
+                                .notify_keyboard_keycode(42, false)
+                                .await
+                                .map_err(portal_err)?;
+                        }
                     }
-                } else {
+                } else if let Some(keysym) = unicode_to_keysym(unicode) {
                     debug!(
-                        "Unicode release 0x{:04X}: no evdev mapping (non-ASCII or unmapped)",
+                        "Unicode release 0x{:04X} -> XKB keysym 0x{:08X}",
+                        unicode, keysym
+                    );
+                    session_handle
+                        .notify_keyboard_keysym(keysym, false)
+                        .await
+                        .map_err(portal_err)?;
+                } else {
+                    // Buffered CJK character — no release event needed
+                    debug!(
+                        "Unicode release 0x{:04X}: skipping (buffered or unmapped)",
                         unicode
                     );
                 }
@@ -629,6 +783,87 @@ impl LamcoInputHandler {
         }
 
         Ok(())
+    }
+
+    /// Flush buffered CJK text via clipboard write + synthetic Ctrl+V.
+    ///
+    /// Pauses cooperation sync before writing to clipboard so Klipper's
+    /// clipboardHistoryUpdated doesn't trigger "已复制" toasts on the client.
+    /// Saves and restores the original clipboard content around the paste.
+    async fn flush_cjk_buffer(
+        session_handle: &Arc<dyn crate::session::SessionHandle>,
+        cjk_buffer: &mut CjkPasteBuffer,
+        clipboard_provider: &Option<Arc<dyn ClipboardProvider>>,
+        cjk_paste_paused: &Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        let Some(text) = cjk_buffer.take_text() else {
+            return;
+        };
+        let char_count = text.chars().count();
+
+        if let Some(provider) = clipboard_provider {
+            // Save current clipboard content so we can restore it after the paste.
+            let saved_clipboard = provider.read_data("text/plain").await.ok();
+
+            // Pause cooperation sync BEFORE writing to clipboard.
+            // This prevents Klipper's clipboardHistoryUpdated from triggering
+            // SendInitiateCopy back to the client (which shows "已复制" toast).
+            if let Some(flag) = cjk_paste_paused {
+                flag.store(true, Ordering::Release);
+                debug!("CJK paste: cooperation sync paused");
+            }
+
+            if let Err(e) = provider.write_text(&text).await {
+                warn!("CJK paste fallback: clipboard write failed: {e}");
+            }
+
+            // Allow clipboard to propagate before sending Ctrl+V
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Ctrl+V: KEY_LEFTCTRL=29, KEY_V=47
+            let send_key = |keycode: i32, pressed: bool| {
+                let sh = Arc::clone(session_handle);
+                async move {
+                    if let Err(e) = sh.notify_keyboard_keycode(keycode, pressed).await {
+                        warn!("CJK paste fallback: keycode inject failed: {e}");
+                    }
+                }
+            };
+            send_key(29, true).await;
+            send_key(47, true).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            send_key(47, false).await;
+            send_key(29, false).await;
+
+            // Wait for Ctrl+V to be processed before restoring clipboard
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Restore original clipboard content
+            if let Some(saved) = saved_clipboard {
+                if let Ok(saved_text) = String::from_utf8(saved) {
+                    if let Err(e) = provider.write_text(&saved_text).await {
+                        warn!("CJK paste: clipboard restore failed: {e}");
+                    } else {
+                        debug!("CJK paste: clipboard content restored");
+                    }
+                }
+            }
+
+            // Wait for Klipper to process the restore write before resuming sync.
+            // Without this, the Klipper event from the restore could arrive at the
+            // cooperation handler AFTER we set paused=false, causing a spurious "已复制".
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Resume cooperation sync after clipboard is restored and Klipper has settled
+            if let Some(flag) = cjk_paste_paused {
+                flag.store(false, Ordering::Release);
+                debug!("CJK paste: cooperation sync resumed");
+            }
+        }
+
+        info!("CJK paste fallback: flushed {char_count} chars via clipboard");
     }
 
     /// Handle mouse event with full error handling and logging
@@ -817,16 +1052,66 @@ impl Clone for LamcoInputHandler {
             coordinate_transformer: Arc::clone(&self.coordinate_transformer),
             primary_stream_id: self.primary_stream_id,
             input_tx: self.input_tx.clone(),
+            cjk_paste_enabled: self.cjk_paste_enabled,
+            clipboard_provider: self.clipboard_provider.clone(),
+            cjk_paste_paused: self.cjk_paste_paused.clone(),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::unicode_to_keysym;
+    use super::CjkPasteBuffer;
+
+    #[test]
+    fn unicode_to_keysym_maps_bmp_cjk_to_xkb_unicode_keysym() {
+        assert_eq!(unicode_to_keysym('中' as u16), Some(0x0100_4E2D));
+        assert_eq!(unicode_to_keysym('文' as u16), Some(0x0100_6587));
+    }
+
+    #[test]
+    fn unicode_to_keysym_keeps_latin1_keysyms_direct() {
+        assert_eq!(unicode_to_keysym('é' as u16), Some(0x00E9));
+    }
+
+    #[test]
+    fn unicode_to_keysym_rejects_surrogate_code_units() {
+        assert_eq!(unicode_to_keysym(0xD83D), None);
+        assert_eq!(unicode_to_keysym(0xDE00), None);
+    }
 
     #[test]
     fn test_input_handler_clone() {
         // Verify clone compiles and works
         // Full tests require portal mocking
+    }
+
+    #[test]
+    fn test_cjk_buffer_basic() {
+        let mut buf = CjkPasteBuffer::new();
+        buf.push_char('中');
+        buf.push_char('文');
+        buf.push_char('字');
+        assert!(!buf.is_empty());
+        assert_eq!(buf.take_text(), Some("中文字".to_string()));
+        assert!(buf.is_empty());
+        assert_eq!(buf.take_text(), None);
+    }
+
+    #[test]
+    fn test_surrogate_pair() {
+        let mut buf = CjkPasteBuffer::new();
+        // U+1F600 GRINNING FACE: high=0xD83D, low=0xDE00
+        let result = buf.push_surrogate_pair(0xD83D, 0xDE00);
+        assert_eq!(result, Some('😀'));
+        assert_eq!(buf.take_text(), Some("😀".to_string()));
+    }
+
+    #[test]
+    fn test_buffer_empty_returns_none() {
+        let mut buf = CjkPasteBuffer::new();
+        assert!(buf.is_empty());
+        assert_eq!(buf.take_text(), None);
     }
 }

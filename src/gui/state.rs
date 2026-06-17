@@ -138,6 +138,8 @@ pub struct EditStrings {
     pub cert_path: String,
     pub key_path: String,
     pub valid_days: String,
+    pub password_username: String,
+    pub password: String,
 
     // Video tab
     pub vaapi_device: String,
@@ -217,6 +219,23 @@ impl EditStrings {
             cert_path: config.security.cert_path.display().to_string(),
             key_path: config.security.key_path.display().to_string(),
             valid_days: "365".to_string(),
+            password_username: config
+                .security
+                .password_credentials
+                .keys()
+                .next()
+                .cloned()
+                .or_else(|| {
+                    if config.security.password_username.is_empty() {
+                        None
+                    } else {
+                        Some(config.security.password_username.clone())
+                    }
+                })
+                .unwrap_or_default(),
+            // Do not echo an existing hash back into the password field.
+            // Users can enter a new password to add/update password_credentials[username].
+            password: String::new(),
 
             // Hardware Encoding
             vaapi_device: config.hardware_encoding.vaapi_device.display().to_string(),
@@ -300,13 +319,68 @@ impl EditStrings {
         }
     }
 
+    pub(crate) fn compose_listen_addr(host: &str, port: &str) -> String {
+        let host = host.trim();
+        let port = match port.trim() {
+            "" => "3389",
+            port => port,
+        };
+
+        let normalized_host = if host.is_empty() {
+            "0.0.0.0".to_string()
+        } else if host.starts_with('[') && host.ends_with(']') {
+            host.to_string()
+        } else if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+
+        format!("{normalized_host}:{port}")
+    }
+
     fn parse_listen_addr(addr: &str) -> (String, String) {
+        if let Ok(socket_addr) = addr.parse::<std::net::SocketAddr>() {
+            return (socket_addr.ip().to_string(), socket_addr.port().to_string());
+        }
+
         let parts: Vec<&str> = addr.rsplitn(2, ':').collect();
         if parts.len() == 2 {
-            (parts[1].to_string(), parts[0].to_string())
+            (
+                parts[1]
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_string(),
+                parts[0].to_string(),
+            )
         } else {
             (addr.to_string(), "3389".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EditStrings;
+    use crate::config::Config;
+
+    #[test]
+    fn edit_strings_from_config_strips_ipv6_brackets() {
+        let mut config = Config::default_config().expect("default config");
+        config.server.listen_addr = "[2001:db8::1]:3390".to_string();
+
+        let edit_strings = EditStrings::from_config(&config);
+
+        assert_eq!(edit_strings.server_ip, "2001:db8::1");
+        assert_eq!(edit_strings.server_port, "3390");
+    }
+
+    #[test]
+    fn compose_listen_addr_brackets_ipv6_hosts() {
+        assert_eq!(
+            EditStrings::compose_listen_addr("2001:db8::1", "3390"),
+            "[2001:db8::1]:3390"
+        );
     }
 }
 
