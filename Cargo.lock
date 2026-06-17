@@ -3768,7 +3768,7 @@ dependencies = [
 
 [[package]]
 name = "lamco-rdp-server"
-version = "1.4.2"
+version = "1.4.3"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",
