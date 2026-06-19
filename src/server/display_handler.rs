@@ -94,6 +94,9 @@ use crate::{
     video::{BitmapConverter, BitmapUpdate, RdpPixelFormat},
 };
 
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+use crate::egfx::{HardwareEncoder, create_hardware_encoder};
+
 /// Client-initiated resize request
 ///
 /// Sent from `request_layout()` (sync context) to the pipeline loop (async)
@@ -108,12 +111,31 @@ struct ResizeRequest {
 ///
 /// Supports both AVC420 (standard H.264 4:2:0) and AVC444 (premium H.264 4:4:4).
 /// The codec is selected at runtime based on client capability negotiation.
+///
+/// When `vaapi` or `nvenc` feature is enabled and hardware encoding is enabled
+/// in config, the `Hardware` variant wraps a GPU-accelerated encoder.
 enum VideoEncoder {
     /// Standard H.264 with 4:2:0 chroma subsampling
     Avc420(Avc420Encoder),
     /// Premium H.264 with 4:4:4 chroma via dual-stream encoding
     Avc444(Avc444Encoder),
+    /// GPU-accelerated H.264 via VA-API or NVENC (AVC420 only)
+    #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+    Hardware(SendHardwareEncoder),
 }
+
+/// Wrapper to make `Box<dyn HardwareEncoder>` `Send` for use in async tasks.
+///
+/// # Safety
+/// The VA-API encoder uses `Rc<Display>` internally (not `Send`), but the encoder
+/// is always created and used from the same async task — never shared across threads.
+/// This wrapper asserts `Send` to satisfy the tokio requirement without actual
+/// cross-thread access.
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+struct SendHardwareEncoder(Box<dyn HardwareEncoder>);
+
+#[cfg(any(feature = "vaapi", feature = "nvenc"))]
+unsafe impl Send for SendHardwareEncoder {}
 
 /// Result of encoding a frame - varies by codec
 enum EncodedVideoFrame {
@@ -150,6 +172,16 @@ impl VideoEncoder {
                         aux: frame.stream2_data,
                     })
                 }),
+            #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+            VideoEncoder::Hardware(wrapper) => wrapper
+                .0
+                .encode_bgra(bgra_data, width, height, timestamp_ms)
+                .map(|opt| opt.map(|frame| EncodedVideoFrame::Single(frame.data)))
+                .map_err(|e| {
+                    crate::egfx::EncoderError::EncodeFailed(format!(
+                        "Hardware encoder error: {e:?}"
+                    ))
+                }),
         }
     }
 
@@ -158,13 +190,19 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(_) => "AVC420",
             VideoEncoder::Avc444(_) => "AVC444",
+            #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+            VideoEncoder::Hardware(wrapper) => match wrapper.0.backend_name() {
+                "vaapi" => "VA-API H.264",
+                "nvenc" => "NVENC H.264",
+                other => {
+                    let _ = other;
+                    "Hardware H.264"
+                }
+            },
         }
     }
 
     /// Request IDR keyframe (for PLI or manual recovery)
-    ///
-    /// Forces the next encoded frame to be a full IDR keyframe,
-    /// clearing any accumulated compression artifacts.
     #[expect(
         dead_code,
         reason = "PLI-triggered IDR not yet wired to RDP event loop"
@@ -173,15 +211,18 @@ impl VideoEncoder {
         match self {
             VideoEncoder::Avc420(encoder) => encoder.force_keyframe(),
             VideoEncoder::Avc444(encoder) => encoder.request_idr(),
+            #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+            VideoEncoder::Hardware(wrapper) => wrapper.0.force_keyframe(),
         }
     }
 
     /// Check if periodic IDR is due (non-consuming)
-    /// Used to bypass damage detection and send full frame when IDR fires
     fn is_periodic_idr_due(&self) -> bool {
         match self {
-            VideoEncoder::Avc420(_) => false, // AVC420 doesn't have periodic IDR
+            VideoEncoder::Avc420(_) => false,
             VideoEncoder::Avc444(encoder) => encoder.is_periodic_idr_due(),
+            #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+            VideoEncoder::Hardware(_) => false,
         }
     }
 }
@@ -323,7 +364,6 @@ pub struct LamcoDisplayHandler {
     /// Set true on new connection (in `updates()`), false on disconnect.
     /// The pipeline loop checks this to avoid encoding/sending frames to nobody.
     client_active: Arc<std::sync::atomic::AtomicBool>,
-
     /// Health reporter for forwarding PipeWire stream state to health monitor
     health_reporter: Arc<RwLock<Option<crate::health::HealthReporter>>>,
 
@@ -575,7 +615,6 @@ impl LamcoDisplayHandler {
     pub fn is_client_active(&self) -> bool {
         self.client_active.load(std::sync::atomic::Ordering::SeqCst)
     }
-
     /// Set graphics queue sender for priority multiplexing
     ///
     /// When set, frames will be routed through the graphics queue instead of
@@ -1563,66 +1602,98 @@ impl LamcoDisplayHandler {
                             }
                         };
 
-                        if avc444_enabled {
-                            // Try AVC444 first (premium 4:4:4 chroma)
-                            match Avc444Encoder::new(config.clone()) {
-                                Ok(mut encoder) => {
-                                    // Wire aux omission config from EgfxConfig
-                                    encoder.configure_aux_omission(
-                                        self.config.egfx.avc444_enable_aux_omission,
-                                        self.config.egfx.avc444_max_aux_interval,
-                                        self.config.egfx.avc444_aux_change_threshold,
-                                        self.config.egfx.avc444_force_aux_idr_on_return,
-                                    );
-                                    // Wire periodic IDR config for artifact recovery
-                                    encoder.configure_periodic_idr(
-                                        self.config.egfx.periodic_idr_interval,
-                                    );
-
-                                    video_encoder = Some(VideoEncoder::Avc444(encoder));
-                                    info!(
-                                        "✅ AVC444 encoder initialized for {}×{} (4:4:4 chroma)",
-                                        aligned_width, aligned_height
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to create AVC444 encoder: {:?} - falling back to AVC420",
-                                        e
-                                    );
-                                    // Fall through to AVC420
-                                    match Avc420Encoder::new(config) {
-                                        Ok(encoder) => {
-                                            video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                            info!(
-                                                "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
-                                                aligned_width, aligned_height
-                                            );
-                                        }
-                                        Err(e) => {
-                                            warn!(
-                                                "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
-                                                e
-                                            );
-                                        }
+                        // ── Hardware encoder (VA-API/NVENC) ──────────────────────
+                        // Try hardware encoding first when enabled in config.
+                        #[cfg(any(feature = "vaapi", feature = "nvenc"))]
+                        {
+                            if self.config.hardware_encoding.enabled {
+                                match create_hardware_encoder(
+                                    &self.config.hardware_encoding,
+                                    aligned_width as u32,
+                                    aligned_height as u32,
+                                ) {
+                                    Ok(hw_encoder) => {
+                                        video_encoder = Some(VideoEncoder::Hardware(
+                                            SendHardwareEncoder(hw_encoder),
+                                        ));
+                                        info!(
+                                            "✅ Hardware encoder initialized for {}×{} (GPU encoding)",
+                                            aligned_width, aligned_height
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Hardware encoder failed: {:?} - falling back to OpenH264",
+                                            e
+                                        );
                                     }
                                 }
                             }
-                        } else {
-                            // Use AVC420 (standard 4:2:0 chroma)
-                            match Avc420Encoder::new(config) {
-                                Ok(encoder) => {
-                                    video_encoder = Some(VideoEncoder::Avc420(encoder));
-                                    info!(
-                                        "✅ AVC420 encoder initialized for {}×{} (aligned)",
-                                        aligned_width, aligned_height
-                                    );
+                        }
+
+                        // ── Software encoder (OpenH264) ──────────────────────────
+                        // Only used when hardware encoder is unavailable or disabled.
+                        if video_encoder.is_none() {
+                            if avc444_enabled {
+                                // Try AVC444 first (premium 4:4:4 chroma)
+                                match Avc444Encoder::new(config.clone()) {
+                                    Ok(mut encoder) => {
+                                        // Wire aux omission config from EgfxConfig
+                                        encoder.configure_aux_omission(
+                                            self.config.egfx.avc444_enable_aux_omission,
+                                            self.config.egfx.avc444_max_aux_interval,
+                                            self.config.egfx.avc444_aux_change_threshold,
+                                            self.config.egfx.avc444_force_aux_idr_on_return,
+                                        );
+                                        // Wire periodic IDR config for artifact recovery
+                                        encoder.configure_periodic_idr(
+                                            self.config.egfx.periodic_idr_interval,
+                                        );
+
+                                        video_encoder = Some(VideoEncoder::Avc444(encoder));
+                                        info!(
+                                            "✅ AVC444 encoder initialized for {}×{} (4:4:4 chroma)",
+                                            aligned_width, aligned_height
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to create AVC444 encoder: {:?} - falling back to AVC420",
+                                            e
+                                        );
+                                        match Avc420Encoder::new(config) {
+                                            Ok(encoder) => {
+                                                video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                                info!(
+                                                    "✅ AVC420 encoder initialized for {}×{} (4:2:0 fallback)",
+                                                    aligned_width, aligned_height
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Failed to create AVC420 encoder: {:?} - falling back to RemoteFX",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
-                                        e
-                                    );
+                            } else {
+                                // Use AVC420 (standard 4:2:0 chroma)
+                                match Avc420Encoder::new(config) {
+                                    Ok(encoder) => {
+                                        video_encoder = Some(VideoEncoder::Avc420(encoder));
+                                        info!(
+                                            "✅ AVC420 encoder initialized for {}×{} (aligned)",
+                                            aligned_width, aligned_height
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to create H.264 encoder: {:?} - falling back to RemoteFX",
+                                            e
+                                        );
+                                    }
                                 }
                             }
                         }
