@@ -194,6 +194,22 @@ impl GfxServerFactory for LamcoGfxFactory {
     }
 
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        // This is called while IronRDP attaches channels for a new connection.
+        // Clear readiness here, before the new client's EGFX capability exchange;
+        // the handler below will repopulate it from on_ready(). Do not clear this
+        // later from the display pipeline, because that races with Android's fast
+        // AVC_DISABLED negotiation and leaves the pipeline stuck in bitmap fallback.
+        for attempt in 0..100 {
+            match self.handler_state.try_write() {
+                Ok(mut state) => {
+                    *state = None;
+                    break;
+                }
+                Err(_) if attempt < 10 => std::thread::yield_now(),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(1)),
+            }
+        }
+
         // Handler updates handler_state when callbacks are invoked,
         // allowing EgfxFrameSender to check EGFX readiness
         let handler = LamcoGraphicsHandler::with_config(

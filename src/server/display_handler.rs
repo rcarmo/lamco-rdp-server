@@ -85,7 +85,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::{
     damage::{DamageConfig, DamageDetector, DamageRegion},
-    egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig},
+    egfx::{Avc420Encoder, Avc444Encoder, ColorSpaceConfig, EncoderConfig, align_to_16},
     performance::{AdaptiveFpsController, EncodingDecision, LatencyGovernor, LatencyMode},
     pipewire::{PipeWireThreadCommand, PipeWireThreadManager, VideoFrame},
     portal::StreamInfo,
@@ -378,6 +378,47 @@ pub struct LamcoDisplayHandler {
 }
 
 impl LamcoDisplayHandler {
+    fn pad_frame_to_aligned(
+        data: &[u8],
+        width: u32,
+        height: u32,
+        aligned_width: u32,
+        aligned_height: u32,
+    ) -> Vec<u8> {
+        let bytes_per_pixel = 4;
+        let src_stride = width * bytes_per_pixel;
+        let dst_stride = aligned_width * bytes_per_pixel;
+        let mut padded = vec![0u8; (aligned_width * aligned_height * bytes_per_pixel) as usize];
+
+        for y in 0..height {
+            let src_offset = (y * src_stride) as usize;
+            let dst_offset = (y * dst_stride) as usize;
+            padded[dst_offset..dst_offset + src_stride as usize]
+                .copy_from_slice(&data[src_offset..src_offset + src_stride as usize]);
+
+            if aligned_width > width {
+                let last_pixel_src = src_offset + (src_stride - bytes_per_pixel) as usize;
+                for x in width..aligned_width {
+                    let dst_offset = (y * dst_stride + x * bytes_per_pixel) as usize;
+                    padded[dst_offset..dst_offset + bytes_per_pixel as usize].copy_from_slice(
+                        &data[last_pixel_src..last_pixel_src + bytes_per_pixel as usize],
+                    );
+                }
+            }
+        }
+
+        if aligned_height > height {
+            let last_row_offset = ((height - 1) * dst_stride) as usize;
+            let last_row = padded[last_row_offset..last_row_offset + dst_stride as usize].to_vec();
+            for y in height..aligned_height {
+                let dst_offset = (y * dst_stride) as usize;
+                padded[dst_offset..dst_offset + dst_stride as usize].copy_from_slice(&last_row);
+            }
+        }
+
+        padded
+    }
+
     fn crop_frame_to_size(frame: &VideoFrame, width: u16, height: u16) -> VideoFrame {
         let target_width = u32::from(width).min(frame.width);
         let target_height = u32::from(height).min(frame.height);
@@ -1294,14 +1335,11 @@ impl LamcoDisplayHandler {
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            // Clear stale EGFX handler state so is_egfx_ready()
-                            // returns false until the new client's capset arrives.
-                            if let Ok(mut s) = handler.gfx_handler_state.try_write() {
-                                *s = None;
-                            }
-                            if let Ok(mut h) = handler.gfx_server_handle.try_write() {
-                                *h = None;
-                            }
+                            // Reset only per-pipeline EGFX objects here. The shared
+                            // handler state/server handle are connection-owned by
+                            // LamcoGfxFactory::build_server_with_handle(); clearing them
+                            // here races with fast EGFX capability negotiation (Android
+                            // AVC_DISABLED) and prevents Planar init.
                             info!("Pipeline state reset for new client connection");
                         }
                         debug!("Received frame from PipeWire");
@@ -1375,12 +1413,11 @@ impl LamcoDisplayHandler {
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
-                            if let Ok(mut s) = handler.gfx_handler_state.try_write() {
-                                *s = None;
-                            }
-                            if let Ok(mut h) = handler.gfx_server_handle.try_write() {
-                                *h = None;
-                            }
+                            // Reset only per-pipeline EGFX objects here. The shared
+                            // handler state/server handle are connection-owned by
+                            // LamcoGfxFactory::build_server_with_handle(); clearing them
+                            // here races with fast EGFX capability negotiation (Android
+                            // AVC_DISABLED) and prevents Planar init.
                             info!("Pipeline state reset for new client connection (no-frame path)");
                         }
 
@@ -1708,13 +1745,13 @@ impl LamcoDisplayHandler {
                             "🎬 EGFX channel ready - initializing H.264 encoder (needs_init=true)"
                         );
 
-                        // Keep protocol-visible AVC dimensions at the actual desktop size.
-                        // H.264 only requires even dimensions for YUV420; advertising 16-pixel
-                        // macroblock padding (for example 1080→1088) as the EGFX surface/SPS
-                        // makes Android RD Client render corrupted frames or no picture after
-                        // rotation. Encoder-internal padding must remain private.
-                        let encoded_width = frame.width as u16;
-                        let encoded_height = frame.height as u16;
+                        // AVC/H.264 path keeps encoder/surface dimensions 16-pixel
+                        // aligned for Windows mstsc compatibility. Planar clients keep
+                        // using actual-size surfaces in the separate Planar path above.
+                        let display_width = frame.width as u16;
+                        let display_height = frame.height as u16;
+                        let encoded_width = align_to_16(frame.width) as u16;
+                        let encoded_height = align_to_16(frame.height) as u16;
 
                         // Create H.264 encoder with resolution-appropriate level
                         // Use config values for quality settings and color space
@@ -1911,25 +1948,26 @@ impl LamcoDisplayHandler {
                             handler.server_event_tx.read().await.clone(),
                         ) {
                             // Create primary surface for EGFX rendering.
-                            // Must be done BEFORE sending any frames. Keep the
-                            // protocol-visible surface at the actual desktop size;
-                            // Android RD Client does not tolerate advertised
-                            // macroblock padding during rotation.
+                            // Must be done BEFORE sending any frames. For AVC,
+                            // keep the RDP desktop/monitor at the visible size but
+                            // create a 16-aligned surface for the encoded frame;
+                            // the AVC region clips presentation to display_width/height.
                             {
                                 info!(
-                                    "📐 Creating EGFX surface at actual desktop size: {}×{}",
-                                    encoded_width, encoded_height
+                                    "📐 Creating EGFX AVC surface: display {}×{}, encoded surface {}×{}",
+                                    display_width, display_height, encoded_width, encoded_height
                                 );
 
                                 let mut server =
                                     gfx_handle.lock().expect("GfxServerHandle mutex poisoned");
 
-                                // CRITICAL: Set desktop size BEFORE creating surface so
-                                // ResetGraphics, CreateSurface, SPS, and regions agree.
-                                server.set_output_dimensions(encoded_width, encoded_height);
+                                // CRITICAL: Set desktop size BEFORE creating surface.
+                                // ResetGraphics advertises the visible desktop; CreateSurface
+                                // may be larger for H.264 macroblock compatibility.
+                                server.set_output_dimensions(display_width, display_height);
                                 info!(
-                                    "✅ EGFX desktop dimensions set: {}×{} (actual)",
-                                    frame.width, frame.height
+                                    "✅ EGFX desktop dimensions set: {}×{} (visible)",
+                                    display_width, display_height
                                 );
 
                                 // Send ResetGraphics with 1 monitor entry before CreateSurface.
@@ -1939,27 +1977,31 @@ impl LamcoDisplayHandler {
                                 {
                                     use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
                                     server.resize_with_monitors(
-                                        encoded_width,
-                                        encoded_height,
+                                        display_width,
+                                        display_height,
                                         vec![Monitor {
                                             left: 0,
                                             top: 0,
-                                            right: encoded_width as i32 - 1,
-                                            bottom: encoded_height as i32 - 1,
+                                            right: display_width as i32 - 1,
+                                            bottom: display_height as i32 - 1,
                                             flags: MonitorFlags::PRIMARY,
                                         }],
                                     );
                                 }
 
-                                // Create surface with actual dimensions.
-                                // create_surface() auto-ResetGraphics is skipped because
-                                // resize_with_monitors already set reset_graphics_sent=true.
+                                // Create the AVC surface at encoded dimensions. Windows mstsc
+                                // requires H.264/AVC surfaces and bitstreams to stay 16-aligned;
+                                // Planar clients use the separate actual-size path above.
                                 if let Some(surface_id) =
                                     server.create_surface(encoded_width, encoded_height)
                                 {
                                     info!(
-                                        "✅ EGFX surface {} created ({}×{})",
-                                        surface_id, encoded_width, encoded_height
+                                        "✅ EGFX AVC surface {} created (encoded {}×{}, visible {}×{})",
+                                        surface_id,
+                                        encoded_width,
+                                        encoded_height,
+                                        display_width,
+                                        display_height
                                     );
                                     // Map surface to output at origin (0,0)
                                     if server.map_surface_to_output(surface_id, 0, 0) {
@@ -2166,14 +2208,24 @@ impl LamcoDisplayHandler {
                             }
                         }
 
-                        // Encode and advertise the actual frame dimensions.
-                        // Do not pad to 16-pixel macroblocks here: OpenH264 accepts
-                        // even YUV420 sizes such as 1920×1080, and leaking padded
-                        // sizes into EGFX regions/surfaces breaks Android RD Client
-                        // especially after portrait/landscape rotation.
-                        let frame_data = (*frame.data).clone();
-                        let encoded_width = frame.width as u32;
-                        let encoded_height = frame.height as u32;
+                        // AVC/H.264 uses 16-aligned encoded dimensions for Windows
+                        // compatibility. Keep display_width/display_height as the visible
+                        // region, and pad only the encoder input so Planar/Android remains
+                        // actual-size in its separate path.
+                        let encoded_width = align_to_16(frame.width);
+                        let encoded_height = align_to_16(frame.height);
+                        let frame_data =
+                            if encoded_width != frame.width || encoded_height != frame.height {
+                                Self::pad_frame_to_aligned(
+                                    &frame.data,
+                                    frame.width,
+                                    frame.height,
+                                    encoded_width,
+                                    encoded_height,
+                                )
+                            } else {
+                                (*frame.data).clone()
+                            };
 
                         // OpenH264's encode() is synchronous and CPU-bound.
                         // On slow hardware (e.g., QEMU VMs) it can block for seconds.
@@ -2648,25 +2700,13 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             self.egfx_needs_init
                 .store(true, std::sync::atomic::Ordering::SeqCst);
 
-            // Clear handler state to force waiting for NEW EGFX channel negotiation.
-            // The new connection's GfxServerFactory.build_server_with_handle() will
-            // create fresh state when the client's EGFX DVC channel is established.
-            // Must use write().await (not try_write) — a silent failure here leaves
-            // stale is_ready=true state, preventing EGFX reinit for the new client.
-            {
-                let mut state = self.gfx_handler_state.write().await;
-                *state = None;
-                info!("Cleared gfx_handler_state for new EGFX negotiation");
-            }
-
-            // Clear stale server handle — it points to the old client's
-            // GraphicsPipelineServer and would cause create_surface to fail
-            // or send PDUs to a dead session
-            {
-                let mut handle = self.gfx_server_handle.write().await;
-                *handle = None;
-                info!("Cleared gfx_server_handle for new client");
-            }
+            // Do not clear gfx_handler_state/gfx_server_handle here. IronRDP calls
+            // LamcoGfxFactory::build_server_with_handle() while attaching channels
+            // for the new connection; that factory installs the fresh handle and
+            // clears readiness before capability negotiation. Clearing after that
+            // point races with Android EGFX AVC_DISABLED negotiation and leaves the
+            // display pipeline stuck in FastPath bitmap fallback (mouse works,
+            // video black).
 
             // Reset bitmap converter so the new client gets a full initial frame.
             // The converter caches the last frame hash for dirty-region optimization;

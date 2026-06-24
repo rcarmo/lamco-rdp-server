@@ -24,6 +24,9 @@ This fork adds several features and fixes for practical KDE Plasma / Wayland dep
 - **Portal + Token strategy** -- preferred for systemd user deployments to avoid duplicate ScreenCast prompts on service restart.
 - **Session preservation** -- keeps active RDP sessions alive when mstsc opens short side-connections after initial authentication.
 
+### Android / Microsoft RD Client Fixes
+- **Android black-screen recovery** -- fixes Microsoft RD Client on Android showing a black screen while mouse/input still worked after EGFX reconnect cleanup. Android can advertise EGFX with `AVC_DISABLED`; the server now preserves the connection-owned EGFX handler state and `GfxServerHandle` after channel attach so the Planar/RemoteFX fallback path can initialize instead of falling through to FastPath bitmap fallback. Windows Remote Desktop clients continue to use the normal AVC/EGFX path.
+
 ### Build
 - Debian package (`lamco-rdp-server_1.4.3-1_amd64.deb`) built and tested on Parrot Security 7.2 / Debian 13 with KDE Plasma on Wayland.
 
