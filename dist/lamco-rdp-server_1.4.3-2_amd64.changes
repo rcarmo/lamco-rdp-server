@@ -1,0 +1,27 @@
+Format: 1.8
+Date: Thu, 18 Jun 2026 16:45:00 +0800
+Source: lamco-rdp-server
+Binary: lamco-rdp-server
+Architecture: amd64
+Version: 1.4.3-2
+Distribution: unstable
+Urgency: medium
+Maintainer: Greg Lamberson <greg@lamco.io>
+Changed-By: Greg Lamberson <greg@lamco.io>
+Description:
+ lamco-rdp-server - Native Wayland RDP server for Linux desktop sharing
+Changes:
+ lamco-rdp-server (1.4.3-2) unstable; urgency=medium
+ .
+   * fix: Defer KDE Portal RemoteDesktop startup until an RDP client connects
+   * feat: Add systemd user socket activation unit for idle listening on 3389
+   * fix: Make Debian installs default to socket activation, not a direct service
+Checksums-Sha1:
+ 9e40671e9ab126c27970099235c17fd97d42e184 8632 lamco-rdp-server_1.4.3-2_amd64.buildinfo
+ c87fe3e588b2b1d0e85e277f7b1119bd15257351 15910752 lamco-rdp-server_1.4.3-2_amd64.deb
+Checksums-Sha256:
+ 87b1836534dbef410507eb13ad710bfde1fa28d3946dff343ef604dfc4dbe380 8632 lamco-rdp-server_1.4.3-2_amd64.buildinfo
+ c58ed9ed4965055de0b2b268177df1516e5627c95e7d2f92482dfb6d65a96068 15910752 lamco-rdp-server_1.4.3-2_amd64.deb
+Files:
+ 330b88d93bab9b541b166a49710e592e 8632 non-free/net optional lamco-rdp-server_1.4.3-2_amd64.buildinfo
+ 0507f020ced0b6d2c443ed01678d82bf 15910752 non-free/net optional lamco-rdp-server_1.4.3-2_amd64.deb

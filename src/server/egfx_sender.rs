@@ -714,8 +714,8 @@ impl EgfxFrameSender {
     pub async fn send_frame_with_regions(
         &self,
         h264_data: &[u8],
-        _encoded_width: u16,
-        _encoded_height: u16,
+        encoded_width: u16,
+        encoded_height: u16,
         display_width: u16,
         display_height: u16,
         damage_regions: &[DamageRegion],
@@ -739,8 +739,16 @@ impl EgfxFrameSender {
 
         let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
 
+        // CRITICAL: When damage_regions is empty (full frame update), use encoded
+        // dimensions for the region. Windows mstsc requires the AVC region to match
+        // the encoded frame dimensions (16-pixel aligned), not the display dimensions.
+        // The H.264 bitstream contains encoded_width×encoded_height macroblocks; the
+        // region must cover the entire encoded frame or mstsc will reject/black-screen.
+        //
+        // For damage regions (partial updates), we still use display_width/height
+        // because damage detection operates on the visible display area.
         let regions = if damage_regions.is_empty() {
-            vec![Avc420Region::full_frame(display_width, display_height, 22)]
+            vec![Avc420Region::full_frame(encoded_width, encoded_height, 22)]
         } else {
             damage_regions_to_avc420(damage_regions, display_width, display_height)
         };
@@ -810,8 +818,8 @@ impl EgfxFrameSender {
         &self,
         stream1_data: &[u8],
         stream2_data: Option<&[u8]>, // Now optional!
-        _encoded_width: u16,
-        _encoded_height: u16,
+        encoded_width: u16,
+        encoded_height: u16,
         display_width: u16,
         display_height: u16,
         damage_regions: &[DamageRegion],
@@ -835,8 +843,11 @@ impl EgfxFrameSender {
 
         let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
 
+        // Same fix as send_frame_with_regions: full-frame regions must use encoded
+        // (16-aligned) dimensions so Windows mstsc sees a region that covers the
+        // entire H.264 bitstream. Partial damage regions stay at display size.
         let regions = if damage_regions.is_empty() {
-            vec![Avc420Region::full_frame(display_width, display_height, 22)]
+            vec![Avc420Region::full_frame(encoded_width, encoded_height, 22)]
         } else {
             damage_regions_to_avc420(damage_regions, display_width, display_height)
         };

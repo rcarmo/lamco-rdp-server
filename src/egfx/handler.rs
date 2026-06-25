@@ -63,6 +63,9 @@ pub struct LamcoGraphicsHandler {
     /// Whether AVC444 was negotiated (V10+ with AVC420)
     avc444_enabled: AtomicBool,
 
+    /// Whether negotiated capabilities indicate the Android RD Client pointer quirk.
+    needs_android_pointer_updates: AtomicBool,
+
     /// Whether the channel is ready for frames (local fast access)
     ready: AtomicBool,
 
@@ -103,6 +106,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -119,6 +123,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -135,6 +140,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -173,6 +179,7 @@ impl LamcoGraphicsHandler {
             height,
             avc420_enabled: AtomicBool::new(false),
             avc444_enabled: AtomicBool::new(false),
+            needs_android_pointer_updates: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             has_surface: AtomicBool::new(false),
             primary_surface_id: AtomicU16::new(0),
@@ -208,6 +215,9 @@ impl LamcoGraphicsHandler {
                             is_ready: self.ready.load(Ordering::Acquire),
                             is_avc420_enabled: self.avc420_enabled.load(Ordering::Acquire),
                             is_avc444_enabled: self.avc444_enabled.load(Ordering::Acquire),
+                            needs_android_pointer_updates: self
+                                .needs_android_pointer_updates
+                                .load(Ordering::Acquire),
                             // Convert has_surface + surface_id to Option<u16>
                             // Surface ID 0 is valid in EGFX, so we use Option instead of sentinel
                             primary_surface_id: if self.has_surface.load(Ordering::Acquire) {
@@ -274,6 +284,21 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         // - V10+ with AVC420_ENABLED → AVC420 AND AVC444v2 (4:4:4 chroma via dual-stream)
         //
         // AVC444v2 provides superior text/UI rendering through full chroma resolution.
+        let needs_android_pointer_updates = match negotiated {
+            CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+                flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
+            }
+            CapabilitySet::V10_3 { flags } => flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+            CapabilitySet::V10_4 { flags }
+            | CapabilitySet::V10_5 { flags }
+            | CapabilitySet::V10_6 { flags }
+            | CapabilitySet::V10_6Err { flags } => {
+                flags.contains(CapabilitiesV104Flags::AVC_DISABLED)
+            }
+            CapabilitySet::V10_7 { flags } => flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+            _ => false,
+        };
+
         let (avc420, avc444) = match negotiated {
             CapabilitySet::V8_1 { flags, .. } => {
                 // V8.1: AVC420 only, no AVC444 support
@@ -341,6 +366,8 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         self.avc420_enabled.store(avc420, Ordering::Release);
         self.avc444_enabled
             .store(effective_avc444, Ordering::Release);
+        self.needs_android_pointer_updates
+            .store(needs_android_pointer_updates, Ordering::Release);
         self.ready.store(true, Ordering::Release);
 
         // Sync to shared state for EgfxFrameSender visibility
@@ -418,6 +445,8 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         );
         self.ready.store(false, Ordering::Release);
         self.avc420_enabled.store(false, Ordering::Release);
+        self.needs_android_pointer_updates
+            .store(false, Ordering::Release);
         self.has_surface.store(false, Ordering::Release);
         // Sync to shared state - channel closed
         self.sync_shared_state();

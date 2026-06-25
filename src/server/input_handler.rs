@@ -74,17 +74,17 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
 
 use ironrdp_pdu::pointer::PointerPositionAttribute;
 use ironrdp_server::{
-    DisplayUpdate, KeyboardEvent as IronKeyboardEvent, MouseEvent as IronMouseEvent,
+    DisplayUpdate, KeyboardEvent as IronKeyboardEvent, MouseEvent as IronMouseEvent, RGBAPointer,
     RdpServerInputHandler,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 /// Accumulates non-ASCII Unicode input units for clipboard-paste fallback.
@@ -143,6 +143,7 @@ use crate::clipboard::provider::ClipboardProvider;
 use crate::input::{
     CoordinateTransformer, InputError, KeyboardHandler, MonitorInfo, MouseButton, MouseHandler,
 };
+use crate::server::gfx_factory::HandlerState;
 
 /// Map a Unicode code point to an evdev keycode and whether Shift is needed.
 /// Covers printable ASCII (0x20-0x7E) on US QWERTY layout.
@@ -373,10 +374,14 @@ pub struct LamcoInputHandler {
     /// Input event queue sender (for multiplexer - bounded with drop policy)
     input_tx: mpsc::Sender<InputEvent>,
 
-    /// Display update channel used to echo pointer shape/position back to clients.
-    /// Android Microsoft RD Client does not draw a local pointer unless the
-    /// server sends pointer updates, even though input injection works.
+    /// Display update channel used only for Android RD Client pointer workaround PDUs.
     pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
+
+    /// Shared EGFX capability state used to gate Android-only pointer workaround PDUs.
+    gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
+
+    /// Whether the Android workaround cursor bitmap was already sent this connection.
+    pointer_shape_sent: Arc<AtomicBool>,
 
     /// Whether CJK clipboard-paste fallback is enabled (from config)
     cjk_paste_enabled: bool,
@@ -396,6 +401,7 @@ impl LamcoInputHandler {
         primary_stream_id: u32,
         input_tx: mpsc::Sender<InputEvent>,
         pointer_update_tx: Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
+        gfx_handler_state: Option<Arc<RwLock<Option<HandlerState>>>>,
         mut input_rx: mpsc::Receiver<InputEvent>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
         cjk_paste_enabled: bool,
@@ -422,6 +428,9 @@ impl LamcoInputHandler {
         let clipboard_provider_task = clipboard_provider.clone();
         let cjk_paste_paused_task = cjk_paste_paused.clone();
         let pointer_update_tx_task = pointer_update_tx.clone();
+        let gfx_handler_state_task = gfx_handler_state.clone();
+        let pointer_shape_sent = Arc::new(AtomicBool::new(false));
+        let pointer_shape_sent_task = Arc::clone(&pointer_shape_sent);
 
         tokio::spawn(async move {
             let mut keyboard_batch = Vec::with_capacity(16);
@@ -491,6 +500,8 @@ impl LamcoInputHandler {
                                 mouse_event,
                                 primary_stream_id,
                                 &pointer_update_tx_task,
+                                &gfx_handler_state_task,
+                                &pointer_shape_sent_task,
                             ).await {
                                 let count = consecutive_mouse_errors.fetch_add(1, Ordering::Relaxed) + 1;
                                 if count == 1 {
@@ -537,6 +548,8 @@ impl LamcoInputHandler {
             primary_stream_id,
             input_tx,
             pointer_update_tx,
+            gfx_handler_state,
+            pointer_shape_sent,
             cjk_paste_enabled,
             clipboard_provider,
             cjk_paste_paused,
@@ -561,6 +574,9 @@ impl LamcoInputHandler {
             *mouse = MouseHandler::new();
             debug!("Mouse handler state reset");
         }
+
+        self.pointer_shape_sent.store(false, Ordering::Release);
+        debug!("Android pointer workaround state reset");
 
         info!("✅ Input handler ready for reconnected client");
     }
@@ -903,11 +919,94 @@ impl LamcoInputHandler {
         info!("CJK paste fallback: flushed {char_count} chars via clipboard");
     }
 
-    async fn send_pointer_position_update(
+    fn create_android_arrow_cursor() -> RGBAPointer {
+        const W: u16 = 32;
+        const H: u16 = 32;
+        const HOT_X: u16 = 4;
+        const HOT_Y: u16 = 27;
+        let mut data = vec![0u8; usize::from(W) * usize::from(H) * 4];
+
+        // Draw a simple Breeze-like left pointer, stored vertically flipped for
+        // Microsoft RD Client on Android. Windows clients must not receive this
+        // bitmap, because they render it with normal orientation.
+        for y in 0..24u16 {
+            for x in 0..=y.min(14) {
+                let border = x == 0 || x == y.min(14) || y == 23;
+                let src_y = H - 1 - y;
+                let idx = (usize::from(src_y) * usize::from(W) + usize::from(x)) * 4;
+                let (r, g, b, a) = if border {
+                    (0, 0, 0, 255)
+                } else {
+                    (255, 255, 255, 255)
+                };
+                data[idx] = r;
+                data[idx + 1] = g;
+                data[idx + 2] = b;
+                data[idx + 3] = a;
+            }
+        }
+
+        RGBAPointer {
+            cache_index: 0,
+            width: W,
+            height: H,
+            hot_x: HOT_X,
+            hot_y: HOT_Y,
+            data,
+        }
+    }
+
+    async fn needs_android_pointer_updates(
+        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
+    ) -> bool {
+        let Some(state) = gfx_handler_state else {
+            return false;
+        };
+        state
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|s| s.needs_android_pointer_updates)
+    }
+
+    async fn send_android_pointer_shape_once(
         pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
+        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
+        pointer_shape_sent: &Arc<AtomicBool>,
+    ) {
+        if !Self::needs_android_pointer_updates(gfx_handler_state).await {
+            return;
+        }
+        if pointer_shape_sent
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let Some(update_tx) = pointer_update_tx else {
+            return;
+        };
+        let sender = update_tx.lock().await;
+        if let Err(err) = sender.try_send(DisplayUpdate::RGBAPointer(
+            Self::create_android_arrow_cursor(),
+        )) {
+            trace!("Dropping Android pointer shape update: {err}");
+            pointer_shape_sent.store(false, Ordering::Release);
+        } else {
+            debug!("Sent Android RD Client pointer shape workaround");
+        }
+    }
+
+    async fn send_android_pointer_position_update(
+        pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
+        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
         x: u16,
         y: u16,
     ) {
+        if !Self::needs_android_pointer_updates(gfx_handler_state).await {
+            return;
+        }
         let Some(update_tx) = pointer_update_tx else {
             return;
         };
@@ -915,7 +1014,7 @@ impl LamcoInputHandler {
         let update = DisplayUpdate::PointerPosition(PointerPositionAttribute { x, y });
         let sender = update_tx.lock().await;
         if let Err(err) = sender.try_send(update) {
-            trace!("Dropping pointer position update: {err}");
+            trace!("Dropping Android pointer position update: {err}");
         }
     }
 
@@ -928,6 +1027,8 @@ impl LamcoInputHandler {
         event: IronMouseEvent,
         stream_id: u32,
         pointer_update_tx: &Option<Arc<Mutex<mpsc::Sender<DisplayUpdate>>>>,
+        gfx_handler_state: &Option<Arc<RwLock<Option<HandlerState>>>>,
+        pointer_shape_sent: &Arc<AtomicBool>,
     ) -> Result<(), InputError> {
         let mut mouse = mouse_handler.lock().await;
         let mut transformer = coordinate_transformer.lock().await;
@@ -948,7 +1049,19 @@ impl LamcoInputHandler {
                     }
                 };
 
-                Self::send_pointer_position_update(pointer_update_tx, x, y).await;
+                Self::send_android_pointer_shape_once(
+                    pointer_update_tx,
+                    gfx_handler_state,
+                    pointer_shape_sent,
+                )
+                .await;
+                Self::send_android_pointer_position_update(
+                    pointer_update_tx,
+                    gfx_handler_state,
+                    x,
+                    y,
+                )
+                .await;
 
                 session_handle
                     .notify_pointer_motion_absolute(stream_id, stream_x, stream_y)
@@ -973,7 +1086,19 @@ impl LamcoInputHandler {
                 // We converted relative to absolute already
                 let pointer_x = stream_x.clamp(0.0, f64::from(u16::MAX)).round() as u16;
                 let pointer_y = stream_y.clamp(0.0, f64::from(u16::MAX)).round() as u16;
-                Self::send_pointer_position_update(pointer_update_tx, pointer_x, pointer_y).await;
+                Self::send_android_pointer_shape_once(
+                    pointer_update_tx,
+                    gfx_handler_state,
+                    pointer_shape_sent,
+                )
+                .await;
+                Self::send_android_pointer_position_update(
+                    pointer_update_tx,
+                    gfx_handler_state,
+                    pointer_x,
+                    pointer_y,
+                )
+                .await;
 
                 session_handle
                     .notify_pointer_motion_absolute(stream_id, stream_x, stream_y)
@@ -1113,6 +1238,8 @@ impl Clone for LamcoInputHandler {
             primary_stream_id: self.primary_stream_id,
             input_tx: self.input_tx.clone(),
             pointer_update_tx: self.pointer_update_tx.clone(),
+            gfx_handler_state: self.gfx_handler_state.clone(),
+            pointer_shape_sent: Arc::clone(&self.pointer_shape_sent),
             cjk_paste_enabled: self.cjk_paste_enabled,
             clipboard_provider: self.clipboard_provider.clone(),
             cjk_paste_paused: self.cjk_paste_paused.clone(),

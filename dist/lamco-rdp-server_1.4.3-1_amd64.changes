@@ -1,0 +1,35 @@
+Format: 1.8
+Date: Tue, 17 Jun 2026 10:00:00 +0000
+Source: lamco-rdp-server
+Binary: lamco-rdp-server
+Architecture: amd64
+Version: 1.4.3-1
+Distribution: unstable
+Urgency: medium
+Maintainer: Greg Lamberson <greg@lamco.io>
+Changed-By: Greg Lamberson <greg@lamco.io>
+Description:
+ lamco-rdp-server - Native Wayland RDP server for Linux desktop sharing
+Changes:
+ lamco-rdp-server (1.4.3-1) unstable; urgency=medium
+ .
+   * feat: Add static password authentication with multi-user support
+   * feat: Add IPv6 listen address support
+   * feat: Add Portal host app identity registration for KDE compatibility
+   * fix: Restore KDE clipboard sync via data-control/wl-clipboard provider
+   * fix: Cache RDP clipboard text for data-control backends
+   * fix: Route CJK input via Portal keysym injection for BMP characters
+   * fix: Pause Klipper cooperation sync during CJK clipboard-paste fallback
+     - Prevents "已复制" toast spam during Chinese/Japanese/Korean typing
+     - Preserves original clipboard content after CJK paste operations
+     - Shares cjk_paste_paused flag between input handler and ClipboardOrchestrator
+   * fix: Handle Portal + Token strategy for systemd user deployments
+Checksums-Sha1:
+ 0bbbd34c49264ea479c95f8050aa3370bacabaa9 8632 lamco-rdp-server_1.4.3-1_amd64.buildinfo
+ def1208e271a5aab5aa5802e3ced72159e4bb1f9 15897340 lamco-rdp-server_1.4.3-1_amd64.deb
+Checksums-Sha256:
+ 8e48979ffd85969d1e7a98075f4717563db517672c049dc3787ba1416e59a22d 8632 lamco-rdp-server_1.4.3-1_amd64.buildinfo
+ 024861f88c4c871311e198884c70efe1d1bda729029e57c86f14c8d3793a27ab 15897340 lamco-rdp-server_1.4.3-1_amd64.deb
+Files:
+ 71148275db0eaa14ff995b38d108240e 8632 non-free/net optional lamco-rdp-server_1.4.3-1_amd64.buildinfo
+ e4126ac61f0465762cdaa08144d8cf94 15897340 non-free/net optional lamco-rdp-server_1.4.3-1_amd64.deb

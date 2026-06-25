@@ -806,6 +806,11 @@ impl LamcoDisplayHandler {
         Arc::clone(&self.update_sender)
     }
 
+    /// Get shared EGFX capability state for Android-only client quirk gating.
+    pub fn get_gfx_handler_state(&self) -> Arc<RwLock<Option<HandlerState>>> {
+        Arc::clone(&self.gfx_handler_state)
+    }
+
     /// Shutdown PipeWire thread explicitly
     ///
     /// Must be called during server shutdown to ensure PipeWire thread exits.
@@ -1333,6 +1338,12 @@ impl LamcoDisplayHandler {
                             video_encoder = None;
                             egfx_sender = None;
                             planar_encoder = None;
+                            // Clear cached frame from previous session. The old frame
+                            // was captured for a different client (possibly different
+                            // codec/size). Replaying it into the new EGFX surface
+                            // before proper init causes garbled display on cross-client
+                            // reconnection (e.g. Windows→Android).
+                            cached_frame = None;
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1341,7 +1352,7 @@ impl LamcoDisplayHandler {
                             // LamcoGfxFactory::build_server_with_handle(); clearing them
                             // here races with fast EGFX capability negotiation (Android
                             // AVC_DISABLED) and prevents Planar init.
-                            info!("Pipeline state reset for new client connection");
+                            info!("Pipeline state reset for new client connection (cache cleared)");
                         }
                         debug!("Received frame from PipeWire");
                         f
@@ -1411,6 +1422,10 @@ impl LamcoDisplayHandler {
                             video_encoder = None;
                             egfx_sender = None;
                             planar_encoder = None;
+                            // Clear cached frame from previous session (same reason
+                            // as the Some-arm: avoid replaying stale frames across
+                            // different clients/codecs).
+                            cached_frame = None;
                             handler
                                 .egfx_needs_init
                                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1419,7 +1434,7 @@ impl LamcoDisplayHandler {
                             // LamcoGfxFactory::build_server_with_handle(); clearing them
                             // here races with fast EGFX capability negotiation (Android
                             // AVC_DISABLED) and prevents Planar init.
-                            info!("Pipeline state reset for new client connection (no-frame path)");
+                            info!("Pipeline state reset for new client connection (no-frame path, cache cleared)");
                         }
 
                         let needs_init = handler
@@ -1593,10 +1608,29 @@ impl LamcoDisplayHandler {
                 // dynamic channel is present.
                 let is_egfx_rfx = !egfx_gate_bypassed && !is_avc && handler.is_egfx_ready().await;
                 if needs_init && !is_avc && !is_egfx_rfx {
-                    // V8 client: clear flag now, no EGFX setup needed
-                    handler
-                        .egfx_needs_init
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    // Distinguish between:
+                    // 1. V8 client (no EGFX channel at all) → clear flag now
+                    // 2. EGFX negotiation still pending (e.g. Android V10 with AVC_DISABLED) → wait
+                    //
+                    // If gfx_handler_state exists but is_ready is false, the capability
+                    // exchange hasn't completed yet. We must NOT clear egfx_needs_init
+                    // because Planar setup runs after negotiation finishes.
+                    let caps_pending = handler
+                        .gfx_handler_state
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|s| !s.is_ready)
+                        .unwrap_or(false);
+
+                    if !caps_pending {
+                        // V8 client: no EGFX capability state, no setup needed
+                        handler
+                            .egfx_needs_init
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        debug!("V8 check: skipping egfx_needs_init clear (caps still pending)");
+                    }
                 }
 
                 // === EGFX Planar PATH (AVC disabled) ===

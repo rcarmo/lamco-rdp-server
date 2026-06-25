@@ -104,6 +104,13 @@ pub struct HandlerState {
     pub is_avc420_enabled: bool,
     /// Whether AVC444 (H.264 YUV444) codec is supported
     pub is_avc444_enabled: bool,
+    /// Whether this client needs Android RD Client pointer workaround updates.
+    ///
+    /// Android clients that negotiate EGFX with AVC_DISABLED do not reliably draw
+    /// a visible local pointer unless the server sends explicit pointer PDUs.
+    /// Windows clients must not receive this workaround because the Android cursor
+    /// bitmap is vertically flipped for that client quirk.
+    pub needs_android_pointer_updates: bool,
     /// Primary surface ID for frame sending (None = no surface yet)
     /// Note: Surface ID 0 is valid in EGFX, so we use Option
     pub primary_surface_id: Option<u16>,
