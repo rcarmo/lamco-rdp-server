@@ -1,3 +1,12 @@
+lamco-rdp-server (1.4.4-1) unstable; urgency=medium
+
+  * fix: Use encoded (16-aligned) dimensions for full-frame AVC420 regions
+  * fix: Clear cached frames on disconnect to prevent cross-client garbled display
+  * fix: Guard egfx_needs_init against pending EGFX capability negotiation
+  * feat: Android RD Client pointer workaround (shape + position PDUs)
+
+ -- Greg Lamberson <greg@lamco.io>  Wed, 25 Jun 2026 09:30:00 +0800
+
 lamco-rdp-server (1.4.3-2) unstable; urgency=medium
 
   * fix: Defer KDE Portal RemoteDesktop startup until an RDP client connects
