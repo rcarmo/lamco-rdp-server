@@ -570,49 +570,11 @@ impl EgfxFrameSender {
             );
         }
 
-        let (frame_id, dvc_messages, channel_id) = {
-            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
-            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
+        let _ = (surface_id, planar_data, display_width, display_height, timestamp_ms);
 
-            let frame_id = server
-                .send_planar_frame(
-                    surface_id,
-                    planar_data,
-                    display_width,
-                    display_height,
-                    timestamp_ms,
-                )
-                .ok_or(SendError::Backpressure)?;
-
-            let messages = server.drain_output();
-            (frame_id, messages, channel_id)
-        };
-
-        if !dvc_messages.is_empty() {
-            let svc_messages =
-                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
-
-            let event = ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                messages: svc_messages,
-            });
-
-            self.event_tx
-                .send(event)
-                .map_err(|_| SendError::ChannelClosed)?;
-        }
-
-        let count = self
-            .frame_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count.is_multiple_of(30) {
-            debug!(
-                "EGFX Planar: Sent frame {} (id={}, {}x{}, {}B encoded)",
-                count, frame_id, display_width, display_height, encoded_len,
-            );
-        }
-
-        Ok(frame_id)
+        Err(SendError::EncodingFailed(
+            "EGFX Planar send is not available in the currently pinned IronRDP fork".to_string(),
+        ))
     }
 
     /// Send an uncompressed frame via EGFX channel
@@ -640,53 +602,12 @@ impl EgfxFrameSender {
 
         let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
 
-        // Send raw bitmap data via EGFX with Codec1Type::Uncompressed
-        let (frame_id, dvc_messages, channel_id) = {
-            let mut server = self.gfx_server.lock().map_err(|_| SendError::LockFailed)?;
-            let channel_id = server.channel_id().ok_or(SendError::NotReady)?;
+        let _ = (surface_id, bitmap, display_width, display_height, timestamp_ms);
 
-            let frame_id = server
-                .send_uncompressed_frame(
-                    surface_id,
-                    &bitmap.data,
-                    display_width,
-                    display_height,
-                    timestamp_ms,
-                )
-                .ok_or(SendError::Backpressure)?;
-
-            let messages = server.drain_output();
-            (frame_id, messages, channel_id)
-        };
-
-        if !dvc_messages.is_empty() {
-            let svc_messages =
-                encode_dvc_messages(channel_id, dvc_messages, ChannelFlags::SHOW_PROTOCOL)
-                    .map_err(|e| SendError::EncodingFailed(e.to_string()))?;
-
-            let event = ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                messages: svc_messages,
-            });
-
-            self.event_tx
-                .send(event)
-                .map_err(|_| SendError::ChannelClosed)?;
-        }
-
-        let count = self
-            .frame_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        tracing::info!(
-            "📹 EGFX Uncompressed: frame {} (id={}, {}x{}, {} bytes raw)",
-            count,
-            frame_id,
-            display_width,
-            display_height,
-            bitmap.data.len(),
-        );
-
-        Ok(frame_id)
+        Err(SendError::EncodingFailed(
+            "EGFX uncompressed send is not available in the currently pinned IronRDP fork"
+                .to_string(),
+        ))
     }
 
     /// Check if AVC444 is supported by the client
