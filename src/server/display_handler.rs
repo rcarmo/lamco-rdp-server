@@ -415,6 +415,67 @@ pub struct LamcoDisplayHandler {
 }
 
 impl LamcoDisplayHandler {
+    fn should_rotate_rdp_frame_180() -> bool {
+        static ROTATE: AtomicBool = AtomicBool::new(false);
+        static INIT: AtomicBool = AtomicBool::new(false);
+
+        if !INIT.swap(true, Ordering::SeqCst) {
+            let enabled = std::env::var("LAMCO_RDP_ROTATE_180")
+                .map(|value| {
+                    let value = value.trim().to_ascii_lowercase();
+                    matches!(value.as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(false);
+
+            ROTATE.store(enabled, Ordering::SeqCst);
+            if enabled {
+                warn!("LAMCO_RDP_ROTATE_180 enabled: rotating outgoing RDP frames by 180 degrees");
+            }
+        }
+
+        ROTATE.load(Ordering::Relaxed)
+    }
+
+    fn rotate_frame_180(frame: &VideoFrame) -> VideoFrame {
+        let bytes_per_pixel = frame.format.bytes_per_pixel() as usize;
+        let width = frame.width as usize;
+        let height = frame.height as usize;
+        let src_stride = frame.stride as usize;
+        let dst_stride = width.saturating_mul(bytes_per_pixel);
+
+        if width == 0 || height == 0 || bytes_per_pixel == 0 {
+            return frame.clone();
+        }
+
+        let required_src_len = src_stride.saturating_mul(height.saturating_sub(1)) + dst_stride;
+        if frame.data.len() < required_src_len {
+            warn!(
+                "Skipping 180-degree frame rotation: frame buffer too small (len={}, required={})",
+                frame.data.len(),
+                required_src_len
+            );
+            return frame.clone();
+        }
+
+        let mut rotated = vec![0u8; dst_stride * height];
+        for y in 0..height {
+            let src_y = height - 1 - y;
+            for x in 0..width {
+                let src_x = width - 1 - x;
+                let src_offset = src_y * src_stride + src_x * bytes_per_pixel;
+                let dst_offset = y * dst_stride + x * bytes_per_pixel;
+                rotated[dst_offset..dst_offset + bytes_per_pixel]
+                    .copy_from_slice(&frame.data[src_offset..src_offset + bytes_per_pixel]);
+            }
+        }
+
+        let mut out = frame.clone();
+        out.stride = dst_stride as u32;
+        out.data = Arc::new(rotated);
+        out.damage_regions.clear();
+        out
+    }
+
     fn pad_frame_to_aligned(
         data: &[u8],
         width: u32,
@@ -1533,6 +1594,12 @@ impl LamcoDisplayHandler {
                     } else {
                         frame
                     }
+                };
+
+                let frame = if Self::should_rotate_rdp_frame_180() {
+                    Self::rotate_frame_180(&frame)
+                } else {
+                    frame
                 };
 
                 let should_process = if adaptive_fps_enabled {
