@@ -436,7 +436,32 @@ impl LamcoDisplayHandler {
         ROTATE.load(Ordering::Relaxed)
     }
 
-    fn rotate_frame_180(frame: &VideoFrame) -> VideoFrame {
+    fn should_flip_rdp_frame_vertical() -> bool {
+        static FLIP: AtomicBool = AtomicBool::new(false);
+        static INIT: AtomicBool = AtomicBool::new(false);
+
+        if !INIT.swap(true, Ordering::SeqCst) {
+            let enabled = std::env::var("LAMCO_RDP_FLIP_VERTICAL")
+                .map(|value| {
+                    let value = value.trim().to_ascii_lowercase();
+                    matches!(value.as_str(), "1" | "true" | "yes" | "on")
+                })
+                .unwrap_or(false);
+
+            FLIP.store(enabled, Ordering::SeqCst);
+            if enabled {
+                warn!("LAMCO_RDP_FLIP_VERTICAL enabled: vertically flipping outgoing RDP frames");
+            }
+        }
+
+        FLIP.load(Ordering::Relaxed)
+    }
+
+    fn copy_frame_with_transform(
+        frame: &VideoFrame,
+        transform_name: &str,
+        mut src_xy: impl FnMut(usize, usize, usize, usize) -> (usize, usize),
+    ) -> VideoFrame {
         let bytes_per_pixel = frame.format.bytes_per_pixel() as usize;
         let width = frame.width as usize;
         let height = frame.height as usize;
@@ -450,30 +475,42 @@ impl LamcoDisplayHandler {
         let required_src_len = src_stride.saturating_mul(height.saturating_sub(1)) + dst_stride;
         if frame.data.len() < required_src_len {
             warn!(
-                "Skipping 180-degree frame rotation: frame buffer too small (len={}, required={})",
+                "Skipping {} frame transform: frame buffer too small (len={}, required={})",
+                transform_name,
                 frame.data.len(),
                 required_src_len
             );
             return frame.clone();
         }
 
-        let mut rotated = vec![0u8; dst_stride * height];
+        let mut transformed = vec![0u8; dst_stride * height];
         for y in 0..height {
-            let src_y = height - 1 - y;
             for x in 0..width {
-                let src_x = width - 1 - x;
+                let (src_x, src_y) = src_xy(x, y, width, height);
                 let src_offset = src_y * src_stride + src_x * bytes_per_pixel;
                 let dst_offset = y * dst_stride + x * bytes_per_pixel;
-                rotated[dst_offset..dst_offset + bytes_per_pixel]
+                transformed[dst_offset..dst_offset + bytes_per_pixel]
                     .copy_from_slice(&frame.data[src_offset..src_offset + bytes_per_pixel]);
             }
         }
 
         let mut out = frame.clone();
         out.stride = dst_stride as u32;
-        out.data = Arc::new(rotated);
+        out.data = Arc::new(transformed);
         out.damage_regions.clear();
         out
+    }
+
+    fn flip_frame_vertical(frame: &VideoFrame) -> VideoFrame {
+        Self::copy_frame_with_transform(frame, "vertical flip", |x, y, _width, height| {
+            (x, height - 1 - y)
+        })
+    }
+
+    fn rotate_frame_180(frame: &VideoFrame) -> VideoFrame {
+        Self::copy_frame_with_transform(frame, "180-degree rotation", |x, y, width, height| {
+            (width - 1 - x, height - 1 - y)
+        })
     }
 
     fn pad_frame_to_aligned(
@@ -1594,6 +1631,12 @@ impl LamcoDisplayHandler {
                     } else {
                         frame
                     }
+                };
+
+                let frame = if Self::should_flip_rdp_frame_vertical() {
+                    Self::flip_frame_vertical(&frame)
+                } else {
+                    frame
                 };
 
                 let frame = if Self::should_rotate_rdp_frame_180() {
