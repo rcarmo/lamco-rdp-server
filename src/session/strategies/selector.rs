@@ -149,11 +149,39 @@ impl SessionStrategySelector {
             }
 
             DeploymentContext::SystemdUser { .. } => {
-                // Systemd user services should avoid the libei input-only strategy on KDE:
-                // it creates a second standalone ScreenCast portal session for video, which
-                // can trigger source-selection prompts on every restart. Prefer a single
-                // Portal RemoteDesktop session so the configured host app-id/permission-store
-                // identity has the best chance to reuse authorization.
+                // Systemd user services can still access native compositor protocols.
+                // Prefer portal-generic on wlroots/Smithay compositors: it gives us
+                // unattended video + input + clipboard without relying on a desktop
+                // portal frontend that may not exist in headless/nested sessions.
+                #[cfg(feature = "portal-generic")]
+                if self
+                    .service_registry
+                    .service_level(ServiceId::WlrDirectInput)
+                    >= ServiceLevel::BestEffort
+                {
+                    use super::portal_generic::PortalGenericStrategy;
+
+                    if PortalGenericStrategy::is_available().await {
+                        info!("Selected: portal-generic embedded strategy");
+                        info!(
+                            "   Systemd user deployment with native Wayland protocols: screencopy + virtual input + data-control"
+                        );
+                        info!("   Compositor: {}", caps.compositor);
+                        info!("   Video + Input + Clipboard (no external portal daemon)");
+
+                        return Ok(Box::new(PortalGenericStrategy::new()));
+                    } else {
+                        warn!(
+                            "portal-generic: protocol check failed in systemd user session (missing screencopy or virtual input)"
+                        );
+                        warn!("Falling back to Portal + Token strategy");
+                    }
+                }
+
+                // KDE and other portal-first desktops should avoid the libei input-only
+                // strategy here: it creates a second standalone ScreenCast portal session
+                // for video, which can trigger source-selection prompts on every restart.
+                // Prefer a single Portal RemoteDesktop session as the fallback.
                 info!("Systemd user deployment: using Portal + Token strategy");
                 info!("Avoiding libei input-only + standalone ScreenCast startup prompt");
 
