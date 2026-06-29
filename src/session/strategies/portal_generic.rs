@@ -515,6 +515,30 @@ impl SessionHandle for PortalGenericSessionHandle {
     }
 
     async fn notify_pointer_motion_absolute(&self, stream_id: u32, x: f64, y: f64) -> Result<()> {
+        // xdg-desktop-portal-generic follows the RemoteDesktop portal contract:
+        // absolute pointer coordinates are normalized 0.0–1.0 within the selected
+        // PipeWire stream. Lamco's RDP coordinate transformer produces pixel
+        // coordinates in stream space, so normalize them here before injecting
+        // into the embedded backend. Without this, wlr_virtual_pointer receives
+        // huge absolute values and the pointer appears inert/off-screen.
+        let (x, y) = if x > 1.0 || y > 1.0 {
+            let stream = self
+                .streams
+                .iter()
+                .find(|stream| stream.node_id == stream_id)
+                .or_else(|| self.streams.first());
+
+            if let Some(stream) = stream {
+                let width = f64::from(stream.width.max(1));
+                let height = f64::from(stream.height.max(1));
+                ((x / width).clamp(0.0, 1.0), (y / height).clamp(0.0, 1.0))
+            } else {
+                (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))
+            }
+        } else {
+            (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0))
+        };
+
         let event = InputEvent::Pointer(PointerEvent::MotionAbsolute {
             x,
             y,
