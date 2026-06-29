@@ -602,25 +602,39 @@ impl LamcoRdpServer {
                 .first()
                 .map_or((1920, 1080), |s| (s.size.0 as u16, s.size.1 as u16));
 
-            let (graphics_tx, graphics_rx) = tokio::sync::mpsc::channel(64);
+            let (graphics_tx, graphics_rx, gfx_factory, gfx_handler_state, gfx_server_handle) =
+                if config.egfx.enabled {
+                    let (graphics_tx, graphics_rx) = tokio::sync::mpsc::channel(64);
 
-            let force_avc420_only = capabilities
-                .profile
-                .has_quirk(&crate::compositor::Quirk::ForceAvc420);
-            let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
-                "auto" => CompressionMode::Auto,
-                "always" => CompressionMode::Always,
-                _ => CompressionMode::Never,
-            };
-            let gfx_factory = LamcoGfxFactory::with_config(
-                initial_size.0,
-                initial_size.1,
-                force_avc420_only,
-                config.egfx.max_frames_in_flight,
-                compression_mode,
-            );
-            let gfx_handler_state = gfx_factory.handler_state();
-            let gfx_server_handle = gfx_factory.server_handle();
+                    let force_avc420_only = capabilities
+                        .profile
+                        .has_quirk(&crate::compositor::Quirk::ForceAvc420);
+                    let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str()
+                    {
+                        "auto" => CompressionMode::Auto,
+                        "always" => CompressionMode::Always,
+                        _ => CompressionMode::Never,
+                    };
+                    let gfx_factory = LamcoGfxFactory::with_config(
+                        initial_size.0,
+                        initial_size.1,
+                        force_avc420_only,
+                        config.egfx.max_frames_in_flight,
+                        compression_mode,
+                    );
+                    let gfx_handler_state = gfx_factory.handler_state();
+                    let gfx_server_handle = gfx_factory.server_handle();
+                    (
+                        Some(graphics_tx),
+                        Some(graphics_rx),
+                        Some(Box::new(gfx_factory) as Box<dyn ironrdp_server::GfxServerFactory>),
+                        Some(gfx_handler_state),
+                        Some(gfx_server_handle),
+                    )
+                } else {
+                    info!("EGFX disabled by configuration; rdpgfx dynamic channel will not be advertised");
+                    (None, None, None, None, None)
+                };
 
             let display_handler = Arc::new(match pipewire_source {
                 PipeWireSource::Fd(raw_fd) => {
@@ -635,9 +649,9 @@ impl LamcoRdpServer {
                         initial_size.1,
                         pipewire_fd,
                         stream_info.clone(),
-                        Some(graphics_tx),
-                        Some(gfx_server_handle),
-                        Some(gfx_handler_state),
+                        graphics_tx,
+                        gfx_server_handle,
+                        gfx_handler_state,
                         Arc::clone(&config),
                         Arc::clone(&service_registry),
                     )
@@ -649,9 +663,9 @@ impl LamcoRdpServer {
                     initial_size.1,
                     raw_rx,
                     stream_info.clone(),
-                    Some(graphics_tx),
-                    Some(gfx_server_handle),
-                    Some(gfx_handler_state),
+                    graphics_tx,
+                    gfx_server_handle,
+                    gfx_handler_state,
                     Arc::clone(&config),
                     Arc::clone(&service_registry),
                 )
@@ -678,8 +692,8 @@ impl LamcoRdpServer {
             // (reported after clipboard init below)
 
             let update_sender = display_handler.get_update_sender();
-            let _graphics_drain_handle =
-                graphics_drain::start_graphics_drain_task(graphics_rx, update_sender);
+            let _graphics_drain_handle = graphics_rx
+                .map(|graphics_rx| graphics_drain::start_graphics_drain_task(graphics_rx, update_sender));
             Arc::clone(&display_handler).start_pipeline();
 
             let tls_config = TlsConfig::from_files_with_options(
@@ -891,7 +905,7 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(wlr_clipboard_factory)
-                    .with_gfx_factory(Some(Box::new(gfx_factory)))
+                    .with_gfx_factory(gfx_factory)
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .build()
             } else {
@@ -915,7 +929,7 @@ impl LamcoRdpServer {
                     .with_display_handler((*display_handler).clone())
                     .with_bitmap_codecs(codecs)
                     .with_cliprdr_factory(None)
-                    .with_gfx_factory(Some(Box::new(gfx_factory)))
+                    .with_gfx_factory(gfx_factory)
                     .with_sound_factory(Some(Box::new(sound_factory)))
                     .build()
             };
@@ -1088,41 +1102,59 @@ impl LamcoRdpServer {
         let (input_tx, input_rx) = tokio::sync::mpsc::channel(256); // Priority 1: Input - increased for mouse burst handling
         let (_control_tx, control_rx) = tokio::sync::mpsc::channel(16); // Priority 2: Control
         let (_clipboard_tx, clipboard_rx) = tokio::sync::mpsc::channel(8); // Priority 3: Clipboard
-        let (graphics_tx, graphics_rx) = tokio::sync::mpsc::channel(64); // Priority 4: Graphics - increased for frame coalescing
-        info!("📊 Full multiplexer queues created:");
-        info!("   Input queue: 256 (Priority 1 - handles mouse bursts)");
-        info!("   Control queue: 16 (Priority 2 - session critical)");
-        info!("   Clipboard queue: 8 (Priority 3 - user operations)");
-        info!("   Graphics queue: 64 (Priority 4 - damage region coalescing)");
+        let (graphics_tx, graphics_rx, gfx_factory, gfx_handler_state, gfx_server_handle) =
+            if config.egfx.enabled {
+                let (graphics_tx, graphics_rx) = tokio::sync::mpsc::channel(64); // Priority 4: Graphics - increased for frame coalescing
+                info!("📊 Full multiplexer queues created:");
+                info!("   Input queue: 256 (Priority 1 - handles mouse bursts)");
+                info!("   Control queue: 16 (Priority 2 - session critical)");
+                info!("   Clipboard queue: 8 (Priority 3 - user operations)");
+                info!("   Graphics queue: 64 (Priority 4 - damage region coalescing)");
 
-        // ForceAvc420 quirk: AVC444 dual-stream too expensive on this platform
-        let force_avc420_only = capabilities
-            .profile
-            .has_quirk(&crate::compositor::Quirk::ForceAvc420);
+                // ForceAvc420 quirk: AVC444 dual-stream too expensive on this platform
+                let force_avc420_only = capabilities
+                    .profile
+                    .has_quirk(&crate::compositor::Quirk::ForceAvc420);
 
-        let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
-            "auto" => CompressionMode::Auto,
-            "always" => CompressionMode::Always,
-            _ => CompressionMode::Never, // Default: no compression
-        };
-        info!("ZGFX compression mode: {:?}", compression_mode);
+                let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str() {
+                    "auto" => CompressionMode::Auto,
+                    "always" => CompressionMode::Always,
+                    _ => CompressionMode::Never, // Default: no compression
+                };
+                info!("ZGFX compression mode: {:?}", compression_mode);
 
-        let gfx_factory = LamcoGfxFactory::with_config(
-            initial_size.0,
-            initial_size.1,
-            force_avc420_only,
-            config.egfx.max_frames_in_flight,
-            compression_mode,
-        );
-        let gfx_handler_state = gfx_factory.handler_state();
-        let gfx_server_handle = gfx_factory.server_handle();
-        if force_avc420_only {
-            info!(
-                "EGFX factory created for H.264/AVC420 streaming (AVC444 disabled by platform quirk)"
-            );
-        } else {
-            info!("EGFX factory created for H.264/AVC420+AVC444 streaming");
-        }
+                let gfx_factory = LamcoGfxFactory::with_config(
+                    initial_size.0,
+                    initial_size.1,
+                    force_avc420_only,
+                    config.egfx.max_frames_in_flight,
+                    compression_mode,
+                );
+                let gfx_handler_state = gfx_factory.handler_state();
+                let gfx_server_handle = gfx_factory.server_handle();
+                if force_avc420_only {
+                    info!(
+                        "EGFX factory created for H.264/AVC420 streaming (AVC444 disabled by platform quirk)"
+                    );
+                } else {
+                    info!("EGFX factory created for H.264/AVC420+AVC444 streaming");
+                }
+                (
+                    Some(graphics_tx),
+                    Some(graphics_rx),
+                    Some(Box::new(gfx_factory) as Box<dyn ironrdp_server::GfxServerFactory>),
+                    Some(gfx_handler_state),
+                    Some(gfx_server_handle),
+                )
+            } else {
+                info!("📊 Full multiplexer queues created:");
+                info!("   Input queue: 256 (Priority 1 - handles mouse bursts)");
+                info!("   Control queue: 16 (Priority 2 - session critical)");
+                info!("   Clipboard queue: 8 (Priority 3 - user operations)");
+                info!("   Graphics queue disabled because EGFX is disabled by configuration");
+                info!("EGFX disabled by configuration; rdpgfx dynamic channel will not be advertised");
+                (None, None, None, None, None)
+            };
 
         let display_handler = Arc::new(
             LamcoDisplayHandler::new(
@@ -1130,9 +1162,9 @@ impl LamcoRdpServer {
                 initial_size.1,
                 pipewire_fd,
                 stream_info.clone(), // streams() returns &[StreamInfo], convert to Vec
-                Some(graphics_tx),   // Graphics queue for multiplexer
-                Some(gfx_server_handle), // EGFX server handle for H.264 frame sending
-                Some(gfx_handler_state), // EGFX handler state for readiness checks
+                graphics_tx,         // Graphics queue for multiplexer
+                gfx_server_handle,   // EGFX server handle for H.264 frame sending
+                gfx_handler_state,   // EGFX handler state for readiness checks
                 Arc::clone(&config), // Pass config for feature flags
                 Arc::clone(&service_registry), // Service registry for feature decisions
             )
@@ -1145,9 +1177,11 @@ impl LamcoRdpServer {
             .await;
 
         let update_sender = display_handler.get_update_sender();
-        let _graphics_drain_handle =
-            graphics_drain::start_graphics_drain_task(graphics_rx, update_sender);
-        info!("Graphics drain task started");
+        let _graphics_drain_handle = graphics_rx.map(|graphics_rx| {
+            let handle = graphics_drain::start_graphics_drain_task(graphics_rx, update_sender);
+            info!("Graphics drain task started");
+            handle
+        });
 
         Arc::clone(&display_handler).start_pipeline();
 
@@ -1567,7 +1601,7 @@ impl LamcoRdpServer {
             .with_display_handler((*display_handler).clone())
             .with_bitmap_codecs(codecs)
             .with_cliprdr_factory(Some(Box::new(clipboard_factory)))
-            .with_gfx_factory(Some(Box::new(gfx_factory)))
+            .with_gfx_factory(gfx_factory)
             .with_sound_factory(Some(Box::new(sound_factory)))
             .build();
 
