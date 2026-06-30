@@ -1657,7 +1657,7 @@ impl LamcoDisplayHandler {
                         let current_fps = if adaptive_fps_enabled {
                             adaptive_fps.current_fps()
                         } else {
-                            30
+                            legacy_fps
                         };
                         info!(
                             "Frame rate regulation: dropped {} frames, sent {}, target_fps={}",
@@ -3234,6 +3234,20 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             "Client requested layout change: {} monitor(s)",
             monitors.len()
         );
+
+        if self.direct_channel_mode {
+            if let Ok(size) = self.size.try_read() {
+                info!(
+                    "Ignoring client layout change in direct-channel mode; compositor capture is fixed at {}x{}",
+                    size.width, size.height
+                );
+            } else {
+                info!(
+                    "Ignoring client layout change in direct-channel mode; compositor capture size is fixed"
+                );
+            }
+            return;
+        }
 
         // Extract the primary monitor (or first monitor for single-monitor case)
         let monitor = match monitors.iter().find(|m| m.is_primary()) {

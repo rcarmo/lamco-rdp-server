@@ -706,7 +706,11 @@ impl LamcoRdpServer {
                 ironrdp_server::tokio_rustls::TlsAcceptor::from(tls_config.server_config());
             let tls_pub_key = tls_config.public_key().ok();
 
-            let codecs = server_codecs_capabilities(&["remotefx"])
+            // Avoid advertising legacy RemoteFX bitmap codecs. Modern clients should
+            // use EGFX/rdpgfx for H.264 transport; RemoteFX is obsolete and some
+            // Microsoft clients advertise RFX capability variants that IronRDP's
+            // strict parser rejects with `invalid RemoteFX capability version`.
+            let codecs = server_codecs_capabilities(&["remotefx:off"])
                 .map_err(|e| anyhow::anyhow!("Failed to create codec capabilities: {e}"))?;
 
             let primary_stream_id = stream_info.first().map_or(0, |s| s.node_id);
@@ -1271,7 +1275,11 @@ impl LamcoRdpServer {
             ironrdp_server::tokio_rustls::TlsAcceptor::from(tls_config.server_config());
         let tls_pub_key = tls_config.public_key().ok();
 
-        let codecs = server_codecs_capabilities(&["remotefx"])
+        // Avoid advertising legacy RemoteFX bitmap codecs. Modern clients should
+        // use EGFX/rdpgfx for H.264 transport; RemoteFX is obsolete and some
+        // Microsoft clients advertise RFX capability variants that IronRDP's
+        // strict parser rejects with `invalid RemoteFX capability version`.
+        let codecs = server_codecs_capabilities(&["remotefx:off"])
             .map_err(|e| anyhow::anyhow!("Failed to create codec capabilities: {e}"))?;
 
         // KDE Bug 515465 (Portal clipboard crash) is handled by the
