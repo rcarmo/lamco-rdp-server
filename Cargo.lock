@@ -9240,8 +9240,6 @@ checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 [[package]]
 name = "xdg-desktop-portal-generic"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e920518e6b6b71c745fe680d0d1dec5f2e2ab9b77a2270abdc8ba96520029f23"
 dependencies = [
  "anyhow",
  "enumflags2",

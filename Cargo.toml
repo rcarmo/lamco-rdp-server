@@ -409,6 +409,15 @@ cast_precision_loss = "allow"
 # =============================================================================
 
 [patch.crates-io]
+# Vendored xdg-desktop-portal-generic with two wlroots virtual-keyboard fixes:
+#  1. Flush the keymap request while the memfd is still open (otherwise the
+#     compositor receives a closed keymap fd and ignores ALL key events).
+#  2. Send explicit zwp_virtual_keyboard_v1.modifiers() after each key so
+#     Shift/Ctrl/Alt/Super actually latch (compositors do not derive modifier
+#     state from virtual-keyboard key events).
+# See bundled-crates/xdg-desktop-portal-generic. Remove once fixed upstream.
+xdg-desktop-portal-generic = { path = "bundled-crates/xdg-desktop-portal-generic" }
+
 # IronRDP fork with combined auth patches (PRs #1150 + #1155)
 # Revert to Devolutions/IronRDP master once both PRs are merged upstream
 ironrdp = { git = "https://github.com/glamberson/IronRDP", branch = "feat/combined-auth-patches" }

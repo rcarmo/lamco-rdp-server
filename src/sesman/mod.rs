@@ -620,7 +620,19 @@ impl Drop for FileLock {
 }
 
 fn process_alive(pid: i32) -> bool {
-    kill(Pid::from_raw(pid), None).is_ok()
+    if kill(Pid::from_raw(pid), None).is_err() {
+        return false;
+    }
+
+    // `kill(pid, 0)` succeeds for zombies, but a sesman component in state Z
+    // is dead for lifecycle purposes and must trigger a restart.
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(after_comm) = stat.rsplit_once(") ").map(|(_, rest)| rest) else {
+        return true;
+    };
+    !after_comm.starts_with('Z')
 }
 
 fn signal_pid(pid: i32, signal: Signal) -> Result<()> {
