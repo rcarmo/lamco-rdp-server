@@ -319,7 +319,7 @@ impl SessionStrategy for PortalGenericStrategy {
                 _capture_backend: Arc::new(Mutex::new(capture_backend)),
                 clipboard_backend: clipboard_backend.map(|cb| Arc::new(Mutex::new(cb))),
                 _pipewire_manager: pipewire_manager,
-                streams,
+                streams: std::sync::Mutex::new(streams),
                 frame_rx: std::sync::Mutex::new(Some(frame_rx)),
             };
 
@@ -384,6 +384,10 @@ impl SessionHandle for PortalGenericSessionWithStop {
         self.handle.streams()
     }
 
+    fn set_streams(&self, streams: Vec<StreamInfo>) {
+        self.handle.set_streams(streams);
+    }
+
     fn session_type(&self) -> SessionType {
         self.handle.session_type()
     }
@@ -421,7 +425,7 @@ pub struct PortalGenericSessionHandle {
     _capture_backend: Arc<Mutex<Box<dyn xdg_desktop_portal_generic::CaptureBackend>>>,
     clipboard_backend: Option<Arc<Mutex<Box<dyn xdg_desktop_portal_generic::ClipboardBackend>>>>,
     _pipewire_manager: Arc<PipeWireManager>,
-    streams: Vec<StreamInfo>,
+    streams: std::sync::Mutex<Vec<StreamInfo>>,
     /// Direct frame channel receiver (taken once by the display handler).
     frame_rx:
         std::sync::Mutex<Option<std::sync::mpsc::Receiver<xdg_desktop_portal_generic::RawFrame>>>,
@@ -450,17 +454,27 @@ impl SessionHandle for PortalGenericSessionHandle {
 
         let Some(raw_rx) = raw_rx else {
             warn!("portal-generic: Direct frame channel already taken, falling back to NodeId");
-            let node_id = self.streams.first().map_or(0, |s| s.node_id);
+            let node_id = self
+                .streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first()
+                .map_or(0, |s| s.node_id);
             return PipeWireAccess::NodeId(node_id);
         };
 
         info!("portal-generic: Using direct frame channel (bypassing PipeWire)");
 
-        // Bridge RawFrame (portal crate) -> RawFrameData (pipewire crate)
-        let (tx, rx) = std::sync::mpsc::sync_channel(256);
+        // Bridge RawFrame (portal crate) -> RawFrameData (pipewire crate).
+        // Keep this queue tiny and non-blocking: direct capture can run at the
+        // compositor refresh rate, and buffering hundreds of frames turns a
+        // transient encoder/input stall into visible desktop latency. If the
+        // display pipeline is behind, drop instead of queueing stale frames.
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
         if let Err(e) = std::thread::Builder::new()
             .name("raw-frame-bridge".into())
             .spawn(move || {
+                let mut dropped: u64 = 0;
                 while let Ok(raw) = raw_rx.recv() {
                     let converted = lamco_pipewire::frame::RawFrameData {
                         data: raw.data,
@@ -469,15 +483,27 @@ impl SessionHandle for PortalGenericSessionHandle {
                         stride: Some(raw.stride),
                         format: None,
                     };
-                    if tx.send(converted).is_err() {
-                        break;
+                    match tx.try_send(converted) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                            dropped = dropped.saturating_add(1);
+                            if dropped == 1 || dropped.is_multiple_of(300) {
+                                warn!("portal-generic: dropped {dropped} stale direct frames to keep latency low");
+                            }
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
                     }
                 }
                 info!("portal-generic: raw-frame-bridge thread exited");
             })
         {
             error!("Failed to spawn raw-frame-bridge thread: {e}");
-            let node_id = self.streams.first().map_or(0, |s| s.node_id);
+            let node_id = self
+                .streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .first()
+                .map_or(0, |s| s.node_id);
             return PipeWireAccess::NodeId(node_id);
         }
 
@@ -485,7 +511,17 @@ impl SessionHandle for PortalGenericSessionHandle {
     }
 
     fn streams(&self) -> Vec<StreamInfo> {
-        self.streams.clone()
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_streams(&self, streams: Vec<StreamInfo>) {
+        *self
+            .streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = streams;
     }
 
     fn session_type(&self) -> SessionType {
@@ -522,11 +558,14 @@ impl SessionHandle for PortalGenericSessionHandle {
         // into the embedded backend. Without this, wlr_virtual_pointer receives
         // huge absolute values and the pointer appears inert/off-screen.
         let (x, y) = if x > 1.0 || y > 1.0 {
-            let stream = self
+            let streams = self
                 .streams
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stream = streams
                 .iter()
                 .find(|stream| stream.node_id == stream_id)
-                .or_else(|| self.streams.first());
+                .or_else(|| streams.first());
 
             if let Some(stream) = stream {
                 let width = f64::from(stream.width.max(1));

@@ -592,6 +592,53 @@ impl LamcoInputHandler {
         Ok(())
     }
 
+    /// Update the single primary stream geometry used by direct-capture sessions.
+    ///
+    /// Portal-generic direct capture can report the real frame size only once
+    /// frames start flowing. Keep both the input coordinate transformer and the
+    /// session's stream metadata in sync with that live size, otherwise mouse
+    /// coordinates are normalized against stale dimensions and land offset or
+    /// off-screen.
+    pub async fn update_primary_stream_geometry(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<(), InputError> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let monitor = MonitorInfo {
+            id: 0,
+            name: "Monitor 0".to_string(),
+            x: 0,
+            y: 0,
+            width,
+            height,
+            dpi: 96.0,
+            scale_factor: 1.0,
+            stream_x: 0,
+            stream_y: 0,
+            stream_width: width,
+            stream_height: height,
+            is_primary: true,
+        };
+
+        self.update_monitors(vec![monitor]).await?;
+        self.session_handle
+            .set_streams(vec![crate::session::strategy::StreamInfo {
+                node_id: self.primary_stream_id,
+                width,
+                height,
+                position_x: 0,
+                position_y: 0,
+            }]);
+
+        info!(
+            "Updated direct input geometry to {}x{} for stream {}",
+            width, height, self.primary_stream_id
+        );
+        Ok(())
+    }
+
     /// Handle keyboard event implementation (static for batching task)
     async fn handle_keyboard_event_impl(
         session_handle: &Arc<dyn crate::session::SessionHandle>,

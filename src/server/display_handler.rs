@@ -1151,6 +1151,11 @@ impl LamcoDisplayHandler {
             // source size, which must be cropped before encoding instead of being
             // advertised back to the RDP client.
             let mut pending_resize: Option<DesktopSize> = None;
+            // Direct-channel capture (portal-generic) learns the authoritative
+            // source dimensions from frames, not PipeWire stream metadata. Track
+            // the live frame size so desktop size, EGFX surfaces, and input
+            // coordinate normalization stay aligned.
+            let mut last_direct_geometry: Option<(u32, u32)> = None;
             let zero_frame_threshold = std::time::Duration::from_secs(10);
 
             // === PTS INTERVAL TRACKING ===
@@ -1390,11 +1395,63 @@ impl LamcoDisplayHandler {
                         }
                     }
 
-                    thread_mgr.try_recv_frame()
+                    let mut latest = thread_mgr.try_recv_frame();
+                    if handler.direct_channel_mode && latest.is_some() {
+                        let mut drained = 0u64;
+                        while let Some(next) = thread_mgr.try_recv_frame() {
+                            latest = Some(next);
+                            drained = drained.saturating_add(1);
+                        }
+                        if drained > 0 && (drained >= 30 || loop_iterations.is_multiple_of(300)) {
+                            debug!("portal-generic: drained {drained} stale queued direct frames");
+                        }
+                    }
+                    latest
                 };
 
                 let frame = match frame {
                     Some(f) => {
+                        if handler.direct_channel_mode {
+                            let frame_geometry = (f.width.max(1), f.height.max(1));
+                            if last_direct_geometry != Some(frame_geometry) {
+                                let target_w = frame_geometry.0.min(u32::from(u16::MAX)) as u16;
+                                let target_h = frame_geometry.1.min(u32::from(u16::MAX)) as u16;
+
+                                info!(
+                                    "portal-generic: direct frame geometry {}x{} -> desktop/input geometry {}x{}",
+                                    f.width, f.height, target_w, target_h
+                                );
+
+                                {
+                                    let mut converter = handler.bitmap_converter.lock().await;
+                                    *converter = BitmapConverter::new(target_w, target_h);
+                                }
+                                if let Some(ref mut detector) = damage_detector_opt {
+                                    detector.invalidate();
+                                }
+
+                                // Force EGFX ResetGraphics/CreateSurface on the new size.
+                                video_encoder = None;
+                                egfx_sender = None;
+                                planar_encoder = None;
+                                handler
+                                    .egfx_needs_init
+                                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                                handler.update_size(target_w, target_h).await;
+
+                                let input_handler = handler.input_handler.read().await.clone();
+                                if let Some(input_handler) = input_handler
+                                    && let Err(e) = input_handler
+                                        .update_primary_stream_geometry(frame_geometry.0, frame_geometry.1)
+                                        .await
+                                {
+                                    warn!("Failed to update direct input geometry: {e}");
+                                }
+
+                                last_direct_geometry = Some(frame_geometry);
+                            }
+                        }
+
                         // Always cache the latest frame for replay on EGFX init.
                         // Clone is cheap: VideoFrame.data is Arc<Vec<u8>>.
                         cached_frame = Some(f.clone());
