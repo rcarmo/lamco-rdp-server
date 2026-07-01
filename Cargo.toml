@@ -16,6 +16,10 @@ name = "lamco-rdp-server"
 path = "src/main.rs"
 
 [[bin]]
+name = "lamco-sesman"
+path = "src/bin/lamco-sesman.rs"
+
+[[bin]]
 name = "lamco-rdp-server-gui"
 path = "src/gui/main.rs"
 required-features = ["gui"]
