@@ -24,8 +24,8 @@ pub mod runtime;
 pub mod security;
 pub mod server;
 pub mod services;
-pub mod session;
 pub mod sesman;
+pub mod session;
 
 /// D-Bus management interface for GUI ↔ server communication.
 /// Session bus for native/Flatpak, system bus for system services.

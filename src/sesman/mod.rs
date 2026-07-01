@@ -199,8 +199,7 @@ impl SesmanConfig {
     }
 
     fn lock_path(&self) -> PathBuf {
-        self.state_dir
-            .join(format!("{}.lock", self.session_name))
+        self.state_dir.join(format!("{}.lock", self.session_name))
     }
 }
 
@@ -310,7 +309,10 @@ impl SessionManager {
 
         let mut status = self.status()?;
         if options.force_restart {
-            info!("force restart requested for session {}", self.config.session_name);
+            info!(
+                "force restart requested for session {}",
+                self.config.session_name
+            );
             self.stop_locked()?;
             status = self.status()?;
         }
@@ -366,7 +368,9 @@ impl SessionManager {
                     .with_context(|| format!("failed to parse {}", state_path.display()))?,
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e).with_context(|| format!("failed to read {}", state_path.display())),
+            Err(e) => {
+                return Err(e).with_context(|| format!("failed to read {}", state_path.display()));
+            }
         };
 
         let Some(ref session_state) = state else {
@@ -423,7 +427,11 @@ impl SessionManager {
 
         let deadline = Instant::now() + Duration::from_millis(self.config.stop_timeout_ms);
         while Instant::now() < deadline {
-            if state.components.iter().all(|component| !process_alive(component.pid)) {
+            if state
+                .components
+                .iter()
+                .all(|component| !process_alive(component.pid))
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
@@ -440,7 +448,10 @@ impl SessionManager {
         match fs::remove_file(&state_path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("failed to remove {}", state_path.display())),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to remove {}", state_path.display()));
+            }
         }
         self.cleanup_runtime_paths();
         Ok(())
@@ -525,7 +536,10 @@ impl SessionManager {
             }
 
             if Instant::now() >= deadline {
-                bail!("timed out waiting for component {} readiness", component.name);
+                bail!(
+                    "timed out waiting for component {} readiness",
+                    component.name
+                );
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -577,8 +591,9 @@ impl FileLock {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if stale_lock(path)? {
                     warn!("removing stale sesman lock {}", path.display());
-                    fs::remove_file(path)
-                        .with_context(|| format!("failed to remove stale lock {}", path.display()))?;
+                    fs::remove_file(path).with_context(|| {
+                        format!("failed to remove stale lock {}", path.display())
+                    })?;
                     Self::acquire(path)
                 } else {
                     Err(anyhow!("session is already locked: {}", path.display()))
@@ -614,7 +629,8 @@ fn signal_pid(pid: i32, signal: Signal) -> Result<()> {
 
 fn open_log(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     OpenOptions::new()
         .create(true)
@@ -648,7 +664,8 @@ fn default_user() -> String {
 }
 
 fn default_xdg_runtime_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from("/run/user/1000"), PathBuf::from)
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map_or_else(|| PathBuf::from("/run/user/1000"), PathBuf::from)
 }
 
 fn default_state_dir() -> PathBuf {
@@ -686,7 +703,6 @@ fn default_cleanup_paths() -> Vec<PathBuf> {
     ]
 }
 
-
 fn default_cleanup_globs() -> Vec<String> {
     vec![format!(
         "{}/niri.wayland-1.*.sock",
@@ -698,7 +714,10 @@ fn remove_stale_path(path: &Path) {
     if let Err(e) = fs::remove_file(path)
         && e.kind() != std::io::ErrorKind::NotFound
     {
-        warn!("failed to remove stale runtime path {}: {e}", path.display());
+        warn!(
+            "failed to remove stale runtime path {}: {e}",
+            path.display()
+        );
     }
 }
 

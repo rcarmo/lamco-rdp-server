@@ -91,7 +91,9 @@ use crate::{
     pipewire::{PipeWireThreadCommand, PipeWireThreadManager, VideoFrame},
     portal::StreamInfo,
     server::{
-        egfx_sender::EgfxFrameSender, event_multiplexer::GraphicsFrame, gfx_factory::HandlerState,
+        egfx_sender::EgfxFrameSender,
+        event_multiplexer::GraphicsFrame,
+        gfx_factory::{HandlerState, NegotiatedEgfxMode},
         input_handler::LamcoInputHandler,
     },
     services::{ServiceId, ServiceRegistry},
@@ -587,6 +589,58 @@ impl LamcoDisplayHandler {
         out
     }
 
+    fn apply_niri_output_resize(width: u16, height: u16) -> std::io::Result<bool> {
+        let Some(socket) = std::fs::read_dir("/run/user/1000")?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("niri.") && name.ends_with(".sock"))
+            })
+            .max_by_key(|path| {
+                path.metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+            })
+        else {
+            return Ok(false);
+        };
+
+        let outputs = std::process::Command::new("/usr/local/bin/niri")
+            .env("NIRI_SOCKET", &socket)
+            .args(["msg", "outputs"])
+            .output()?;
+        if !outputs.status.success() {
+            return Ok(false);
+        }
+        let output_text = String::from_utf8_lossy(&outputs.stdout);
+        let Some(output_name) = output_text
+            .lines()
+            .find_map(|line| line.strip_prefix("Output \"")?.split('"').next())
+        else {
+            return Ok(false);
+        };
+
+        // niri requires an explicit refresh rate for custom modes.
+        // The nested Weston output currently runs at 60Hz; keep this helper
+        // conservative and temporary until sesman owns negotiated geometry.
+        let mode = format!("{}x{}@60.000", width, height);
+        let output = std::process::Command::new("/usr/local/bin/niri")
+            .env("NIRI_SOCKET", &socket)
+            .args(["msg", "output", output_name, "custom-mode", &mode])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                "niri output custom-mode {mode} failed for {output_name}: {}",
+                stderr.trim()
+            );
+        }
+
+        Ok(output.status.success())
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "display handler needs pipeline components at construction"
@@ -880,13 +934,20 @@ impl LamcoDisplayHandler {
         }
     }
 
-    /// Check if AVC420 (H.264) codec is available
+    /// Return the explicit negotiated EGFX mode for the connected client.
+    pub async fn negotiated_egfx_mode(&self) -> Option<NegotiatedEgfxMode> {
+        self.gfx_handler_state
+            .read()
+            .await
+            .as_ref()
+            .and_then(|state| state.negotiated_mode)
+    }
+
+    /// Check if AVC/H.264 is available for the negotiated client mode.
     pub async fn is_avc_supported(&self) -> bool {
-        if let Some(state) = self.gfx_handler_state.read().await.as_ref() {
-            state.is_avc420_enabled
-        } else {
-            false
-        }
+        self.negotiated_egfx_mode()
+            .await
+            .is_some_and(NegotiatedEgfxMode::uses_avc)
     }
 
     /// Get a descriptive reason for why EGFX is not ready
@@ -906,8 +967,13 @@ impl LamcoDisplayHandler {
             if !state.is_ready {
                 return "EGFX channel open, negotiating capabilities";
             }
-            if !state.is_avc420_enabled {
-                return "EGFX ready, no AVC420 - using bitmap fallback";
+            if let Some(mode) = state.negotiated_mode {
+                return match mode {
+                    NegotiatedEgfxMode::Avc420 | NegotiatedEgfxMode::Avc444 => {
+                        "EGFX ready, AVC/H.264 negotiated"
+                    }
+                    NegotiatedEgfxMode::Planar => "EGFX ready, Planar negotiated",
+                };
             }
         } else {
             return "EGFX channel open, initializing handler state";
@@ -1224,14 +1290,64 @@ impl LamcoDisplayHandler {
                         info!("Processing client resize: {}x{}", req.width, req.height);
 
                         if handler.direct_channel_mode {
-                            // Direct frame channel (portal-generic): capture resolution
-                            // is fixed to the compositor's output size. We can't resize
-                            // the capture without wlr-output-management support, so
-                            // silently ignore the request rather than telling the RDP
-                            // client a resolution we can't deliver.
                             info!(
-                                "Resize to {}x{} ignored in direct channel mode \
-                                 (compositor output resolution is fixed)",
+                                "Direct-channel resize requested: {}x{}; applying temporary niri output mode",
+                                req.width, req.height
+                            );
+
+                            match Self::apply_niri_output_resize(req.width, req.height) {
+                                Ok(true) => {
+                                    info!(
+                                        "Direct-channel resize {}x{} applied to niri output",
+                                        req.width, req.height
+                                    );
+                                }
+                                Ok(false) => {
+                                    warn!(
+                                        "Direct-channel resize {}x{} not applied to niri output; accepting RDP desktop size and scaling input/video",
+                                        req.width, req.height
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Direct-channel resize {}x{} failed via niri output control: {e}; accepting RDP desktop size and scaling input/video",
+                                        req.width, req.height
+                                    );
+                                }
+                            }
+
+                            pending_resize = Some(DesktopSize {
+                                width: req.width,
+                                height: req.height,
+                            });
+                            video_encoder = None;
+                            egfx_sender = None;
+                            planar_encoder = None;
+                            handler
+                                .egfx_needs_init
+                                .store(true, std::sync::atomic::Ordering::SeqCst);
+                            handler.update_size(req.width, req.height).await;
+
+                            if let Some((stream_w, stream_h)) = last_direct_geometry {
+                                let input_handler = handler.input_handler.read().await.clone();
+                                if let Some(input_handler) = input_handler
+                                    && let Err(e) = input_handler
+                                        .update_primary_stream_mapping(
+                                            u32::from(req.width),
+                                            u32::from(req.height),
+                                            stream_w,
+                                            stream_h,
+                                        )
+                                        .await
+                                {
+                                    warn!(
+                                        "Failed to update direct input mapping after resize: {e}"
+                                    );
+                                }
+                            }
+
+                            info!(
+                                "Direct-channel resize accepted: RDP desktop {}x{}; capture stream will be cropped/scaled from latest geometry",
                                 req.width, req.height
                             );
                             continue;
@@ -1414,12 +1530,15 @@ impl LamcoDisplayHandler {
                         if handler.direct_channel_mode {
                             let frame_geometry = (f.width.max(1), f.height.max(1));
                             if last_direct_geometry != Some(frame_geometry) {
-                                let target_w = frame_geometry.0.min(u32::from(u16::MAX)) as u16;
-                                let target_h = frame_geometry.1.min(u32::from(u16::MAX)) as u16;
+                                let frame_w = frame_geometry.0.min(u32::from(u16::MAX)) as u16;
+                                let frame_h = frame_geometry.1.min(u32::from(u16::MAX)) as u16;
+                                let current_size = *handler.size.read().await;
+                                let target_w = current_size.width.min(frame_w).max(1);
+                                let target_h = current_size.height.min(frame_h).max(1);
 
                                 info!(
-                                    "portal-generic: direct frame geometry {}x{} -> desktop/input geometry {}x{}",
-                                    f.width, f.height, target_w, target_h
+                                    "portal-generic: direct frame geometry {}x{} -> desktop {}x{} / input stream {}x{}",
+                                    f.width, f.height, target_w, target_h, frame_w, frame_h
                                 );
 
                                 {
@@ -1442,12 +1561,16 @@ impl LamcoDisplayHandler {
                                 let input_handler = handler.input_handler.read().await.clone();
                                 if let Some(input_handler) = input_handler
                                     && let Err(e) = input_handler
-                                        .update_primary_stream_geometry(frame_geometry.0, frame_geometry.1)
+                                        .update_primary_stream_mapping(
+                                            u32::from(target_w),
+                                            u32::from(target_h),
+                                            frame_geometry.0,
+                                            frame_geometry.1,
+                                        )
                                         .await
                                 {
-                                    warn!("Failed to update direct input geometry: {e}");
+                                    warn!("Failed to update direct input mapping: {e}");
                                 }
-
                                 last_direct_geometry = Some(frame_geometry);
                             }
                         }
@@ -1808,12 +1931,16 @@ impl LamcoDisplayHandler {
                     false
                 };
 
-                let is_avc = !egfx_gate_bypassed && handler.is_avc_supported().await;
-                // Android RD Client advertises EGFX with AVC_DISABLED. Use the
-                // EGFX Planar codec path for these clients; FastPath Bitmap/RLE
-                // is not accepted reliably by this Android client once the EGFX
-                // dynamic channel is present.
-                let is_egfx_rfx = !egfx_gate_bypassed && !is_avc && handler.is_egfx_ready().await;
+                let negotiated_egfx_mode = if egfx_gate_bypassed {
+                    None
+                } else {
+                    handler.negotiated_egfx_mode().await
+                };
+                let is_avc = negotiated_egfx_mode.is_some_and(NegotiatedEgfxMode::uses_avc);
+                // Clients that negotiate EGFX but disable/do not support AVC use
+                // the explicit Planar mode. FastPath bitmap remains only for
+                // clients where EGFX never becomes ready or is disabled.
+                let is_egfx_rfx = negotiated_egfx_mode == Some(NegotiatedEgfxMode::Planar);
                 if needs_init && !is_avc && !is_egfx_rfx {
                     // Distinguish between:
                     // 1. V8 client (no EGFX channel at all) → clear flag now
@@ -2032,12 +2159,12 @@ impl LamcoDisplayHandler {
 
                         // Determine codec based on config preference and client capabilities
                         // Config codec setting: "auto", "avc420", "avc444"
+                        let negotiated_mode = handler.negotiated_egfx_mode().await;
                         let client_supports_avc444 =
-                            if let Some(state) = handler.gfx_handler_state.read().await.as_ref() {
-                                state.is_avc444_enabled
-                            } else {
-                                false
-                            };
+                            negotiated_mode == Some(NegotiatedEgfxMode::Avc444);
+                        if let Some(mode) = negotiated_mode {
+                            info!("Client EGFX negotiated mode: {}", mode.name());
+                        }
 
                         // Resolve codec preference from config
                         let codec_pref = self.config.egfx.codec.to_lowercase();
@@ -3172,6 +3299,74 @@ impl RdpServerDisplay for LamcoDisplayHandler {
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
         let mut size = self.size.write().await;
+        info!(
+            "request_initial_size: client requested {}x{}, current server size {}x{}, direct_channel={}",
+            client_size.width,
+            client_size.height,
+            size.width,
+            size.height,
+            self.direct_channel_mode
+        );
+
+        if self.direct_channel_mode {
+            let stream_width = size.width;
+            let stream_height = size.height;
+            if client_size.width > 0 && client_size.height > 0 {
+                if client_size.width != size.width || client_size.height != size.height {
+                    match Self::apply_niri_output_resize(client_size.width, client_size.height) {
+                        Ok(true) => {
+                            info!(
+                                "Applied client initial desktop size to niri output: {}x{} (was {}x{})",
+                                client_size.width, client_size.height, size.width, size.height
+                            );
+                        }
+                        Ok(false) => {
+                            warn!(
+                                "niri output control unavailable for client initial size {}x{}; accepting RDP desktop and scaling from capture {}x{}",
+                                client_size.width, client_size.height, stream_width, stream_height
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to apply client initial size {}x{} via niri output control: {e}; accepting RDP desktop and scaling from capture {}x{}",
+                                client_size.width, client_size.height, stream_width, stream_height
+                            );
+                        }
+                    }
+                } else {
+                    info!(
+                        "Keeping direct-channel geometry {}x{} (client requested same size)",
+                        size.width, size.height
+                    );
+                }
+                *size = client_size;
+                *self.bitmap_converter.lock().await =
+                    BitmapConverter::new(client_size.width, client_size.height);
+
+                let input_handler = self.input_handler.read().await.clone();
+                if let Some(input_handler) = input_handler
+                    && let Err(e) = input_handler
+                        .update_primary_stream_mapping(
+                            u32::from(client_size.width),
+                            u32::from(client_size.height),
+                            u32::from(stream_width),
+                            u32::from(stream_height),
+                        )
+                        .await
+                {
+                    warn!("Failed to update direct input mapping for initial size: {e}");
+                }
+                return *size;
+            }
+
+            info!(
+                "Keeping direct-channel capture geometry {}x{} (client requested invalid {}x{})",
+                size.width, size.height, client_size.width, client_size.height
+            );
+            *self.bitmap_converter.lock().await = BitmapConverter::new(size.width, size.height);
+            return *size;
+        }
+
         if client_size.width > 0
             && client_size.height > 0
             && (client_size.width < size.width || client_size.height < size.height)
@@ -3264,15 +3459,16 @@ impl RdpServerDisplay for LamcoDisplayHandler {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         info!("Client active - pipeline frame processing resumed");
 
-        // Android Microsoft RD Client does not draw a visible remote pointer
-        // when only DefaultPointer (empty PDU) is sent. We must send a real
-        // cursor bitmap via RGBAPointer with actual RGBA pixel data.
-        // Windows clients also benefit from receiving an explicit cursor shape.
+        // Use the client's native/default pointer for normal clients. The
+        // RGBAPointer helper below is vertically flipped for the Android RD
+        // Client workaround and has an Android-specific hotspot; sending it to
+        // every client makes the visible pointer tip differ from the click point.
+        // Android clients that actually need a bitmap pointer still receive one
+        // from the input handler after EGFX negotiation marks that quirk.
         {
             let sender = self.update_sender.lock().await;
-            let arrow = Self::create_arrow_cursor();
-            if let Err(err) = sender.try_send(DisplayUpdate::RGBAPointer(arrow)) {
-                trace!("Dropping initial RGBA pointer update: {err}");
+            if let Err(err) = sender.try_send(DisplayUpdate::DefaultPointer) {
+                trace!("Dropping initial default pointer update: {err}");
             }
         }
 
@@ -3287,23 +3483,15 @@ impl RdpServerDisplay for LamcoDisplayHandler {
         use ironrdp_displaycontrol::pdu::MonitorLayoutEntry;
 
         let monitors = layout.monitors();
-        debug!(
+        info!(
             "Client requested layout change: {} monitor(s)",
             monitors.len()
         );
 
         if self.direct_channel_mode {
-            if let Ok(size) = self.size.try_read() {
-                info!(
-                    "Ignoring client layout change in direct-channel mode; compositor capture is fixed at {}x{}",
-                    size.width, size.height
-                );
-            } else {
-                info!(
-                    "Ignoring client layout change in direct-channel mode; compositor capture size is fixed"
-                );
-            }
-            return;
+            info!(
+                "Client layout change received in direct-channel mode; will try temporary compositor output resize"
+            );
         }
 
         // Extract the primary monitor (or first monitor for single-monitor case)

@@ -235,16 +235,25 @@ impl VaapiEncoder {
             .query_config_entrypoints(h264_profile)
             .map_err(|e| VaapiError::EntrypointQueryFailed(e.to_string()))?;
 
-        if !entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice) {
+        // Prefer the classic H.264 encode entrypoint when available, but most
+        // modern Intel iHD drivers in low-power/container setups only advertise
+        // VAEntrypointEncSliceLP. Treat LP as a first-class H.264 encoder rather
+        // than falling back to OpenH264 just because EncSlice is absent.
+        let encode_entrypoint = if entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice) {
+            VAEntrypoint::VAEntrypointEncSlice
+        } else if entrypoints.contains(&VAEntrypoint::VAEntrypointEncSliceLP) {
+            VAEntrypoint::VAEntrypointEncSliceLP
+        } else {
             return Err(HardwareEncoderError::from(VaapiError::EncodeNotSupported));
-        }
+        };
+        info!("Using VA-API H.264 entrypoint: {:?}", encode_entrypoint);
 
         // Create encode config
         let config = display
             .create_config(
                 vec![], // Use default attributes
                 h264_profile,
-                VAEntrypoint::VAEntrypointEncSlice,
+                encode_entrypoint,
             )
             .map_err(|e| VaapiError::ConfigCreateFailed(e.to_string()))?;
 

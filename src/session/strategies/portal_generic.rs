@@ -260,7 +260,10 @@ impl SessionStrategy for PortalGenericStrategy {
                 capture_tx,
             ).map_err(|e| anyhow::anyhow!("Capture backend: {e}"))?;
 
-            // Request monitor capture with embedded cursor
+            // Request monitor capture without embedding the compositor cursor.
+            // RDP already carries pointer shape/position separately; embedding
+            // the Wayland cursor in the video stream produces two visible
+            // pointers and makes apparent pointer position lag behind input.
             let capture_sources = capture_backend
                 .get_sources(&[SourceType::Monitor])
                 .map_err(|e| anyhow::anyhow!("Get sources: {e}"))?;
@@ -270,7 +273,7 @@ impl SessionStrategy for PortalGenericStrategy {
                 vec![]
             } else {
                 capture_backend
-                    .create_capture_session(&capture_sources, CursorMode::Embedded)
+                    .create_capture_session(&capture_sources, CursorMode::Hidden)
                     .map_err(|e| anyhow::anyhow!("Create capture session: {e}"))?
             };
 

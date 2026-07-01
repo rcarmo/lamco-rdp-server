@@ -25,7 +25,7 @@ use ironrdp_egfx::{
 };
 use tracing::{debug, info, trace, warn};
 
-use crate::server::{HandlerState, SharedHandlerState};
+use crate::server::{HandlerState, NegotiatedEgfxMode, SharedHandlerState};
 
 /// Handler for EGFX graphics pipeline events
 ///
@@ -211,10 +211,26 @@ impl LamcoGraphicsHandler {
                             .as_ref()
                             .map_or(0, |s: &HandlerState| s.dvc_channel_id);
 
+                        let avc420_enabled = self.avc420_enabled.load(Ordering::Acquire);
+                        let avc444_enabled = self.avc444_enabled.load(Ordering::Acquire);
+                        let ready = self.ready.load(Ordering::Acquire);
+                        let negotiated_mode = if ready {
+                            if avc444_enabled {
+                                Some(NegotiatedEgfxMode::Avc444)
+                            } else if avc420_enabled {
+                                Some(NegotiatedEgfxMode::Avc420)
+                            } else {
+                                Some(NegotiatedEgfxMode::Planar)
+                            }
+                        } else {
+                            None
+                        };
+
                         let state = HandlerState {
-                            is_ready: self.ready.load(Ordering::Acquire),
-                            is_avc420_enabled: self.avc420_enabled.load(Ordering::Acquire),
-                            is_avc444_enabled: self.avc444_enabled.load(Ordering::Acquire),
+                            is_ready: ready,
+                            negotiated_mode,
+                            is_avc420_enabled: avc420_enabled,
+                            is_avc444_enabled: avc444_enabled,
                             needs_android_pointer_updates: self
                                 .needs_android_pointer_updates
                                 .load(Ordering::Acquire),
@@ -373,21 +389,24 @@ impl GraphicsPipelineHandler for LamcoGraphicsHandler {
         // Sync to shared state for EgfxFrameSender visibility
         self.sync_shared_state();
 
-        // Log codec capabilities
-        match (avc420, effective_avc444) {
-            (true, true) => {
-                info!("EGFX: AVC420 + AVC444v2 encoding enabled (V10+ capabilities)");
-            }
-            (true, false) if self.force_avc420_only => {
-                info!("EGFX: AVC420 encoding enabled (AVC444 suppressed by platform quirk)");
-            }
-            (true, false) => {
-                info!("EGFX: AVC420 (H.264 4:2:0) encoding enabled");
-            }
-            (false, _) => {
-                info!("EGFX: AVC not supported by client, will use RemoteFX fallback");
-            }
-        }
+        // Log negotiated client mode. The display pipeline may still downgrade
+        // AVC444 to AVC420 due to config, or hardware to software due to runtime
+        // availability, but every client now has a single explicit EGFX mode.
+        let negotiated_mode = if effective_avc444 {
+            NegotiatedEgfxMode::Avc444
+        } else if avc420 {
+            NegotiatedEgfxMode::Avc420
+        } else {
+            NegotiatedEgfxMode::Planar
+        };
+        info!(
+            "EGFX negotiation result: {} (caps={:?}, avc420={}, avc444={}, android_pointer_workaround={})",
+            negotiated_mode.name(),
+            negotiated,
+            avc420,
+            effective_avc444,
+            needs_android_pointer_updates,
+        );
     }
 
     fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {

@@ -92,6 +92,36 @@ pub struct LamcoGfxFactory {
     compression_mode: CompressionMode,
 }
 
+/// Explicit result of EGFX capability negotiation for a connected client.
+///
+/// Keep this separate from the raw capability booleans so the display pipeline
+/// consumes one deterministic client mode instead of re-deriving behavior from
+/// scattered flags. Final encoder selection can still downgrade this mode due to
+/// server configuration or runtime hardware/software encoder failures.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum NegotiatedEgfxMode {
+    /// Client negotiated EGFX and AVC420/H.264 is available.
+    Avc420,
+    /// Client negotiated EGFX V10+ and AVC444v2 is available.
+    Avc444,
+    /// Client negotiated EGFX but disabled/does not support AVC; use EGFX Planar.
+    Planar,
+}
+
+impl NegotiatedEgfxMode {
+    pub const fn uses_avc(self) -> bool {
+        matches!(self, Self::Avc420 | Self::Avc444)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Avc420 => "EGFX AVC420/H.264",
+            Self::Avc444 => "EGFX AVC444v2/H.264",
+            Self::Planar => "EGFX Planar",
+        }
+    }
+}
+
 /// Shared handler state accessible from display handler
 ///
 /// This state is updated by `WrdGraphicsHandler` callbacks and read by
@@ -100,6 +130,8 @@ pub struct LamcoGfxFactory {
 pub struct HandlerState {
     /// Whether EGFX channel is ready (capabilities negotiated)
     pub is_ready: bool,
+    /// Explicit negotiated EGFX mode for this client.
+    pub negotiated_mode: Option<NegotiatedEgfxMode>,
     /// Whether AVC420 (H.264 YUV420) codec is supported
     pub is_avc420_enabled: bool,
     /// Whether AVC444 (H.264 YUV444) codec is supported

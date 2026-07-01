@@ -79,7 +79,7 @@ use std::{net::SocketAddr, os::fd::FromRawFd, sync::Arc};
 use anyhow::{Context, Result};
 pub use display_handler::LamcoDisplayHandler;
 pub use egfx_sender::{EgfxFrameSender, SendError};
-pub use gfx_factory::{HandlerState, LamcoGfxFactory, SharedHandlerState};
+pub use gfx_factory::{HandlerState, LamcoGfxFactory, NegotiatedEgfxMode, SharedHandlerState};
 pub use input_handler::LamcoInputHandler;
 use ironrdp_graphics::zgfx::CompressionMode;
 use ironrdp_pdu::rdp::capability_sets::server_codecs_capabilities;
@@ -609,12 +609,12 @@ impl LamcoRdpServer {
                     let force_avc420_only = capabilities
                         .profile
                         .has_quirk(&crate::compositor::Quirk::ForceAvc420);
-                    let compression_mode = match config.egfx.zgfx_compression.to_lowercase().as_str()
-                    {
-                        "auto" => CompressionMode::Auto,
-                        "always" => CompressionMode::Always,
-                        _ => CompressionMode::Never,
-                    };
+                    let compression_mode =
+                        match config.egfx.zgfx_compression.to_lowercase().as_str() {
+                            "auto" => CompressionMode::Auto,
+                            "always" => CompressionMode::Always,
+                            _ => CompressionMode::Never,
+                        };
                     let gfx_factory = LamcoGfxFactory::with_config(
                         initial_size.0,
                         initial_size.1,
@@ -632,7 +632,9 @@ impl LamcoRdpServer {
                         Some(gfx_server_handle),
                     )
                 } else {
-                    info!("EGFX disabled by configuration; rdpgfx dynamic channel will not be advertised");
+                    info!(
+                        "EGFX disabled by configuration; rdpgfx dynamic channel will not be advertised"
+                    );
                     (None, None, None, None, None)
                 };
 
@@ -692,8 +694,9 @@ impl LamcoRdpServer {
             // (reported after clipboard init below)
 
             let update_sender = display_handler.get_update_sender();
-            let _graphics_drain_handle = graphics_rx
-                .map(|graphics_rx| graphics_drain::start_graphics_drain_task(graphics_rx, update_sender));
+            let _graphics_drain_handle = graphics_rx.map(|graphics_rx| {
+                graphics_drain::start_graphics_drain_task(graphics_rx, update_sender)
+            });
             Arc::clone(&display_handler).start_pipeline();
 
             let tls_config = TlsConfig::from_files_with_options(
@@ -706,11 +709,7 @@ impl LamcoRdpServer {
                 ironrdp_server::tokio_rustls::TlsAcceptor::from(tls_config.server_config());
             let tls_pub_key = tls_config.public_key().ok();
 
-            // Avoid advertising legacy RemoteFX bitmap codecs. Modern clients should
-            // use EGFX/rdpgfx for H.264 transport; RemoteFX is obsolete and some
-            // Microsoft clients advertise RFX capability variants that IronRDP's
-            // strict parser rejects with `invalid RemoteFX capability version`.
-            let codecs = server_codecs_capabilities(&["remotefx:off"])
+            let codecs = server_codecs_capabilities(&["remotefx"])
                 .map_err(|e| anyhow::anyhow!("Failed to create codec capabilities: {e}"))?;
 
             let primary_stream_id = stream_info.first().map_or(0, |s| s.node_id);
@@ -1156,7 +1155,9 @@ impl LamcoRdpServer {
                 info!("   Control queue: 16 (Priority 2 - session critical)");
                 info!("   Clipboard queue: 8 (Priority 3 - user operations)");
                 info!("   Graphics queue disabled because EGFX is disabled by configuration");
-                info!("EGFX disabled by configuration; rdpgfx dynamic channel will not be advertised");
+                info!(
+                    "EGFX disabled by configuration; rdpgfx dynamic channel will not be advertised"
+                );
                 (None, None, None, None, None)
             };
 

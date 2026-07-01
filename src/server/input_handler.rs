@@ -92,6 +92,8 @@ use tracing::{debug, error, info, trace, warn};
 /// RDP sends CJK input as a stream of UnicodePressed events. Since keysym
 /// injection fails for many CJK characters on KDE, we buffer them and flush
 /// via write_text + Ctrl+V when a non-Unicode event (keycode) arrives.
+static MOUSE_MOVE_LOG_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 struct CjkPasteBuffer {
     buf: String,
     pending_high_surrogate: Option<u16>,
@@ -604,21 +606,41 @@ impl LamcoInputHandler {
         width: u32,
         height: u32,
     ) -> Result<(), InputError> {
-        let width = width.max(1);
-        let height = height.max(1);
+        self.update_primary_stream_mapping(width, height, width, height)
+            .await
+    }
+
+    /// Update direct-capture input mapping when the RDP desktop size differs
+    /// from the captured stream size.
+    ///
+    /// `rdp_width`/`rdp_height` are the coordinate space sent by the client.
+    /// `stream_width`/`stream_height` are the compositor/capture coordinate
+    /// space that the Wayland virtual pointer expects. Keeping these separate
+    /// is what makes client-side dynamic resize and pointer injection line up.
+    pub async fn update_primary_stream_mapping(
+        &self,
+        rdp_width: u32,
+        rdp_height: u32,
+        stream_width: u32,
+        stream_height: u32,
+    ) -> Result<(), InputError> {
+        let rdp_width = rdp_width.max(1);
+        let rdp_height = rdp_height.max(1);
+        let stream_width = stream_width.max(1);
+        let stream_height = stream_height.max(1);
         let monitor = MonitorInfo {
             id: 0,
             name: "Monitor 0".to_string(),
             x: 0,
             y: 0,
-            width,
-            height,
+            width: rdp_width,
+            height: rdp_height,
             dpi: 96.0,
             scale_factor: 1.0,
             stream_x: 0,
             stream_y: 0,
-            stream_width: width,
-            stream_height: height,
+            stream_width,
+            stream_height,
             is_primary: true,
         };
 
@@ -626,15 +648,15 @@ impl LamcoInputHandler {
         self.session_handle
             .set_streams(vec![crate::session::strategy::StreamInfo {
                 node_id: self.primary_stream_id,
-                width,
-                height,
+                width: stream_width,
+                height: stream_height,
                 position_x: 0,
                 position_y: 0,
             }]);
 
         info!(
-            "Updated direct input geometry to {}x{} for stream {}",
-            width, height, self.primary_stream_id
+            "Updated direct input mapping: rdp {}x{} -> stream {}x{} for stream {}",
+            rdp_width, rdp_height, stream_width, stream_height, self.primary_stream_id
         );
         Ok(())
     }
@@ -671,6 +693,12 @@ impl LamcoInputHandler {
                     // V key scancode
                     info!(
                         "⌨️ V key pressed (scancode=0x{:02X}, extended={})",
+                        code, extended
+                    );
+                }
+                if code == 0x38 {
+                    info!(
+                        "⌨️ Alt key pressed (scancode=0x{:02X}, extended={})",
                         code, extended
                     );
                 }
@@ -722,6 +750,12 @@ impl LamcoInputHandler {
                     // V key scancode
                     info!(
                         "⌨️ V key released (scancode=0x{:02X}, extended={})",
+                        code, extended
+                    );
+                }
+                if code == 0x38 {
+                    info!(
+                        "⌨️ Alt key released (scancode=0x{:02X}, extended={})",
                         code, extended
                     );
                 }
@@ -1096,6 +1130,14 @@ impl LamcoInputHandler {
                     }
                 };
 
+                let move_count = MOUSE_MOVE_LOG_COUNTER.fetch_add(1, Ordering::Relaxed);
+                if move_count < 12 || move_count.is_multiple_of(60) {
+                    info!(
+                        "Mouse transform: rdp {}x{} -> stream {:.1}x{:.1} (stream_id={})",
+                        x, y, stream_x, stream_y, stream_id
+                    );
+                }
+
                 Self::send_android_pointer_shape_once(
                     pointer_update_tx,
                     gfx_handler_state,
@@ -1260,6 +1302,18 @@ impl LamcoInputHandler {
 
 impl RdpServerInputHandler for LamcoInputHandler {
     fn keyboard(&mut self, event: IronKeyboardEvent) {
+        match &event {
+            IronKeyboardEvent::Pressed { code, extended }
+            | IronKeyboardEvent::Released { code, extended } => {
+                if matches!(*code, 0x2A | 0x36 | 0x1D | 0x38 | 0x5B | 0x5C | 0x77 | 0x78) {
+                    info!(
+                        "Keyboard entry: {:?} scancode=0x{:02X} extended={}",
+                        event, code, extended
+                    );
+                }
+            }
+            _ => {}
+        }
         trace!("⌨️  Input multiplexer: routing keyboard to queue");
         if let Err(e) = self.input_tx.try_send(InputEvent::Keyboard(event)) {
             error!("Failed to queue keyboard event for batching: {}", e);

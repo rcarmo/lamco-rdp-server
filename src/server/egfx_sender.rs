@@ -570,7 +570,13 @@ impl EgfxFrameSender {
             );
         }
 
-        let _ = (surface_id, planar_data, display_width, display_height, timestamp_ms);
+        let _ = (
+            surface_id,
+            planar_data,
+            display_width,
+            display_height,
+            timestamp_ms,
+        );
 
         Err(SendError::EncodingFailed(
             "EGFX Planar send is not available in the currently pinned IronRDP fork".to_string(),
@@ -602,7 +608,13 @@ impl EgfxFrameSender {
 
         let surface_id = state.primary_surface_id.ok_or(SendError::NoSurface)?;
 
-        let _ = (surface_id, bitmap, display_width, display_height, timestamp_ms);
+        let _ = (
+            surface_id,
+            bitmap,
+            display_width,
+            display_height,
+            timestamp_ms,
+        );
 
         Err(SendError::EncodingFailed(
             "EGFX uncompressed send is not available in the currently pinned IronRDP fork"
